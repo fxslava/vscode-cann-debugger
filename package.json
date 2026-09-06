@@ -76,6 +76,12 @@
         "command": "ascend-gdb.openTargetManager",
         "title": "Open NPU Target Manager",
         "category": "Ascend"
+      },
+      {
+        "command": "ascend-gdb.inspectTensor",
+        "title": "Inspect as Tensor...",
+        "category": "Ascend",
+        "icon": "$(graph-scatter)"
       }
     ],
     "menus": {
@@ -87,6 +93,17 @@
         {
           "command": "ascend-gdb.sendMiCommand",
           "when": "inDebugMode && debugType == ascend-gdb"
+        },
+        {
+          "command": "ascend-gdb.inspectTensor",
+          "when": "debugState == stopped && debugType == ascend-gdb"
+        }
+      ],
+      "debug/variables/context": [
+        {
+          "command": "ascend-gdb.inspectTensor",
+          "when": "debugType == ascend-gdb",
+          "group": "1_view@2"
         }
       ],
       "view/title": [

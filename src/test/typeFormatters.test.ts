@@ -10,8 +10,12 @@ import { test } from 'node:test';
 
 import {
 	createDefaultFormatterRegistry,
+	decodeText,
+	escapeCString,
 	firstTemplateArgument,
 	ITypeFormatter,
+	quoteText,
+	StdStringFormatter,
 	StdVectorFormatter,
 	stripCvRef,
 	TypeFormatterRegistry,
@@ -90,6 +94,66 @@ test('declines types whose layout the pointer arithmetic would misread', () => {
 	assert.equal(formatter.match('float *'), false);
 	// A user type that merely starts with the same letters.
 	assert.equal(formatter.match('std::vector_view<int>'), false);
+});
+
+/* -------------------------------------------------------------------------
+ * StdStringFormatter.match
+ * ---------------------------------------------------------------------- */
+
+test('claims the spellings of a byte std::string', () => {
+	const formatter = new StdStringFormatter();
+	assert.equal(formatter.match(
+		'std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >'), true);
+	assert.equal(formatter.match(
+		'std::basic_string<char, std::char_traits<char>, std::allocator<char> >'), true);
+	// The typedef, as some debuggers report it.
+	assert.equal(formatter.match('std::string'), true);
+	assert.equal(formatter.match('const std::__cxx11::string &'), true);
+});
+
+test('declines strings whose characters are not bytes', () => {
+	const formatter = new StdStringFormatter();
+	// wstring, u16string and u32string all need different decoding.
+	assert.equal(formatter.match(
+		'std::__cxx11::basic_string<wchar_t, std::char_traits<wchar_t>, std::allocator<wchar_t> >'),
+		false);
+	assert.equal(formatter.match(
+		'std::__cxx11::basic_string<char16_t, std::char_traits<char16_t> >'), false);
+	assert.equal(formatter.match('std::string_view'), false);
+	assert.equal(formatter.match('char *'), false);
+});
+
+/* -------------------------------------------------------------------------
+ * Text decoding
+ * ---------------------------------------------------------------------- */
+
+test('decodes UTF-8 when the bytes really are UTF-8', () => {
+	assert.equal(decodeText(Buffer.from('hello ascend', 'utf8')), 'hello ascend');
+	assert.equal(decodeText(Buffer.from('naïve café', 'utf8')), 'naïve café');
+	assert.equal(decodeText(Buffer.alloc(0)), '');
+});
+
+test('falls back to raw bytes rather than inventing replacement characters', () => {
+	// A half-initialised buffer is not text; showing the bytes is more honest
+	// than a row of U+FFFD.
+	const invalid = Buffer.from([0x41, 0xff, 0xfe, 0x42]);
+	const decoded = decodeText(invalid);
+	assert.equal(decoded, 'AÿþB');
+	assert.equal(decoded.includes('�'), false);
+});
+
+test('escapes what would otherwise break the row', () => {
+	assert.equal(escapeCString('plain'), 'plain');
+	assert.equal(escapeCString('a\nb\tc'), 'a\\nb\\tc');
+	assert.equal(escapeCString('say "hi"'), 'say \\"hi\\"');
+	assert.equal(escapeCString('back\\slash'), 'back\\\\slash');
+	// Control bytes become hex escapes, not invisible holes.
+	assert.equal(escapeCString('\x00\x1b\x7f'), '\\x00\\x1b\\x7f');
+});
+
+test('marks a clamped read instead of pretending it was the whole string', () => {
+	assert.equal(quoteText('hello', 0), '"hello"');
+	assert.equal(quoteText('hello', 95), '"hello"... (100 chars)');
 });
 
 /* -------------------------------------------------------------------------

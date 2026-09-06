@@ -14,7 +14,7 @@
  *-------------------------------------------------------------------------*/
 
 import { MiConnection, quoteMiString } from './mi/miConnection';
-import { miNumber, miString, miTuple, miArray, MiTuple } from './mi/miParser';
+import { miNumber, miString, miTuple, miArray, miList, MiTuple } from './mi/miParser';
 
 export interface VarObject {
 	/** GDB-assigned handle, e.g. "var12". */
@@ -201,6 +201,40 @@ export async function evaluateInteger(
 		}
 		return BigInt(m[1]);
 	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Read raw bytes at an address, for callers that need the payload rather than
+ * the debugger's rendering of it - a string's characters, say.
+ *
+ * Returns whatever was readable, which may be short, and undefined when the
+ * address is not mapped at all. Deliberately simpler than the session's
+ * readMemoryRequest: that one has to describe holes to the Hex Editor, while
+ * a formatter only needs to know whether it got enough to show something.
+ */
+export async function readMemoryBytes(
+	mi: MiConnection,
+	address: bigint,
+	count: number,
+): Promise<Buffer | undefined> {
+	if (count <= 0) {
+		return Buffer.alloc(0);
+	}
+	try {
+		const record = await mi.sendCommand(
+			`-data-read-memory-bytes 0x${address.toString(16)} ${count}`);
+		let hex = '';
+		for (const block of miList(record.results['memory'], 'memory')) {
+			hex += miString(block['contents']);
+		}
+		if (!hex) {
+			return undefined;
+		}
+		return Buffer.from(hex, 'hex').subarray(0, count);
+	} catch {
+		// "Cannot access memory at address 0x..." - an unmapped or stale pointer.
 		return undefined;
 	}
 }

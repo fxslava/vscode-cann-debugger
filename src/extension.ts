@@ -12,6 +12,7 @@ import { AscendLaunchArguments, NpuMemoryRegion } from './configuration';
 import { DEFAULT_PASSWORD_ENV_VAR } from './sshLauncher';
 import { readPassword } from './targetManager/targetConfig';
 import { TargetViewProvider } from './targetManager/targetViewProvider';
+import { seedFromContext, TensorInspectorPanel } from './tensorInspectorView';
 
 const DEBUG_TYPE = 'ascend-gdb';
 
@@ -38,6 +39,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			targetView.deployAndDebugFromCommand()),
 		vscode.commands.registerCommand('ascend-gdb.openTargetManager', () =>
 			vscode.commands.executeCommand(`${TargetViewProvider.viewType}.focus`)),
+		// Reached from the Variables view context menu, where the argument
+		// carries the clicked variable, and from the palette, where it does not.
+		vscode.commands.registerCommand('ascend-gdb.inspectTensor', (arg?: unknown) =>
+			TensorInspectorPanel.show(context, seedFromContext(arg))),
 	);
 }
 

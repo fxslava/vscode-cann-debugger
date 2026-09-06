@@ -55,6 +55,36 @@ function elementValue(vector: string, index: number): string {
 	return vector === 'scores' ? `${index}.5` : `${100 + index}.25`;
 }
 
+/*
+ * std::string locals, in the libstdc++ C++11 ABI layout: a _M_p that points at
+ * the characters, a length, and a 16-byte local buffer inside the object.
+ */
+interface FakeString {
+	/** Address of the string object itself. */
+	object: number;
+	objectSize: number;
+	/** _M_dataplus._M_p - inside the object under SSO, on the heap otherwise. */
+	data: number;
+	/** What is really at `data`. */
+	text: string;
+	/** What _M_string_length reports, which an uninitialised object may lie about. */
+	length: number;
+}
+
+const STRINGS: { [name: string]: FakeString } = {
+	// Short: _M_p points into the object's own local buffer.
+	label: { object: 0x5000, objectSize: 32, data: 0x5010, text: 'hello ascend', length: 12 },
+	// Long: _M_p points at the heap, well outside the object.
+	banner: { object: 0x5100, objectSize: 32, data: 0x6000, text: 'Ascend C kernel: AddCustom', length: 26 },
+	// Uninitialised: _M_p is inside the object, so the string is short, but the
+	// length field claims far more than the local buffer can hold. A formatter
+	// that trusts the length here invents 99 characters out of stack noise.
+	scratch: { object: 0x5200, objectSize: 32, data: 0x5210, text: 'garbage', length: 99 },
+};
+
+const STRING_TYPE =
+	'std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >';
+
 /** Array-slice varobjs handed out by -var-create, keyed by varobj name. */
 const slices = new Map<string, { vector: string; first: number; length: number }>();
 /** Single-element varobjs, keyed by varobj name -> the expression behind it. */
@@ -162,7 +192,8 @@ function handle(token: string, command: string): void {
 	if (command.startsWith('-stack-list-variables')) {
 		done(token,
 			'variables=[{name="tiling",arg="1"},{name="xGm"},{name="loopCount"},' +
-			'{name="scores"},{name="weights"},{name="tilings"}]');
+			'{name="scores"},{name="weights"},{name="tilings"},' +
+			'{name="label"},{name="banner"},{name="scratch"}]');
 		return;
 	}
 
@@ -215,6 +246,15 @@ function handle(token: string, command: string): void {
 			return;
 		}
 
+		if (STRINGS[expression]) {
+			// Same breakage, different container.
+			done(token,
+				`name="var_${expression}",numchild="1",` +
+				`value="error: summary string parsing error",` +
+				`type="${STRING_TYPE}",has_more="0"`);
+			return;
+		}
+
 		switch (expression) {
 			case 'xGm':
 				done(token, 'name="var1",numchild="0",value="0x2000",type="__gm__ half *",has_more="0"');
@@ -239,10 +279,12 @@ function handle(token: string, command: string): void {
 			done(token, `path_expr="(${elements.get(field[1])}).${field[2]}"`);
 			return;
 		}
-		const map: { [k: string]: string } = {
-			var1: 'xGm', var2: 'loopCount', var3: 'tiling',
-			var_scores: 'scores', var_weights: 'weights', var_tilings: 'tilings',
-		};
+		// Locals are varobj'd as var_<expression>, so the path is the name back.
+		if (name.startsWith('var_')) {
+			done(token, `path_expr="${name.slice(4)}"`);
+			return;
+		}
+		const map: { [k: string]: string } = { var1: 'xGm', var2: 'loopCount', var3: 'tiling' };
 		done(token, `path_expr="${map[name] ?? name}"`);
 		return;
 	}
@@ -265,6 +307,14 @@ function handle(token: string, command: string): void {
 			done(token, structChildren(name));
 			return;
 		}
+		// What the debugger offers when the formatter declines a string: the
+		// raw members, which is the honest answer for an unreadable object.
+		if (name.startsWith('var_') && STRINGS[name.slice(4)]) {
+			done(token,
+				`numchild="1",children=[child={name="${name}._M_dataplus",exp="_M_dataplus",` +
+				'numchild="1",value="{...}",type="std::_Alloc_hider"}],has_more="0"');
+			return;
+		}
 		done(token,
 			'numchild="2",children=[' +
 			'child={name="var3.totalLength",exp="totalLength",numchild="0",value="1024",type="uint32_t"},' +
@@ -274,6 +324,25 @@ function handle(token: string, command: string): void {
 
 	if (command.startsWith('-data-evaluate-expression')) {
 		const expression = /"(.+)"\s*$/.exec(command)?.[1] ?? '';
+
+		// std::string members. _M_p is readable even when the summary is not.
+		const stringMember =
+			/\((\w+)\)\._M_(dataplus\._M_p|string_length)$/.exec(expression);
+		if (stringMember && STRINGS[stringMember[1]]) {
+			const string = STRINGS[stringMember[1]];
+			done(token, `value="${stringMember[2] === 'string_length' ? string.length : string.data}"`);
+			return;
+		}
+		const objectAddress = /^\(unsigned long long\)&\((\w+)\)$/.exec(expression);
+		if (objectAddress && STRINGS[objectAddress[1]]) {
+			done(token, `value="${STRINGS[objectAddress[1]].object}"`);
+			return;
+		}
+		const objectSize = /^sizeof\((\w+)\)$/.exec(expression);
+		if (objectSize && STRINGS[objectSize[1]]) {
+			done(token, `value="${STRINGS[objectSize[1]].objectSize}"`);
+			return;
+		}
 
 		const sizeofElement = /^sizeof\(\*\((\w+)\)\._M_impl\._M_start\)$/.exec(expression);
 		if (sizeofElement && VECTORS[sizeofElement[1]]) {
@@ -308,6 +377,18 @@ function handle(token: string, command: string): void {
 		const m = /-data-read-memory-bytes\s+(\S+)\s+(\d+)/.exec(command);
 		const address = m?.[1] ?? '0x0';
 		const count = Number(m?.[2] ?? '0');
+
+		// String character buffers, wherever _M_p happens to point.
+		const string = Object.values(STRINGS).find((s) => s.data === Number(address));
+		if (string) {
+			const bytes = Buffer.from(string.text, 'utf8').subarray(0, count);
+			const end = `0x${(Number(address) + bytes.length).toString(16)}`;
+			done(token,
+				`memory=[{begin="${address}",offset="0x0",end="${end}",` +
+				`contents="${bytes.toString('hex')}"}]`);
+			return;
+		}
+
 		if (address !== '0x2000') {
 			error(token, `Cannot access memory at address ${address}`);
 			return;

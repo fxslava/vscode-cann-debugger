@@ -11,6 +11,7 @@ import { ChildProcess, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { DebugProtocol } from '@vscode/debugprotocol';
+import { decodeTensor, formatValue, gridShape, shapeElements } from '../tensorDecode';
 
 const OUT_DIR = join(__dirname, '..');
 const ADAPTER = join(OUT_DIR, 'debugAdapter.js');
@@ -415,6 +416,107 @@ test('a watchpoint can be set on a synthetic element', async () => {
 	});
 	// The element's expression, not the literal row label "[2]".
 	assert.equal(info.body.dataId, '*((scores)._M_impl._M_start + 2)');
+});
+
+test('formats a short std::string out of the local buffer', async () => {
+	const label = await local('label');
+	assert.equal(label.value, '"hello ascend"');
+	assert.equal(label.evaluateName, 'label');
+	// Short String Optimization: _M_p points into the object's own footprint,
+	// so the characters are at 0x5010 while the object starts at 0x5000.
+	assert.equal(label.memoryReference, '0x5010');
+
+	const children = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: label.variablesReference,
+	});
+	assert.deepEqual(children.body.variables.map((v) => v.name), ['[text]']);
+	assert.equal(children.body.variables[0].value, '"hello ascend"');
+	assert.equal(children.body.variables[0].type, 'char [12]');
+	assert.equal(children.body.variables[0].evaluateName, '(label)._M_dataplus._M_p');
+});
+
+test('formats a heap-allocated std::string the same way', async () => {
+	const banner = await local('banner');
+	assert.equal(banner.value, '"Ascend C kernel: AddCustom"');
+	// Past the local buffer, so _M_p points at the heap instead.
+	assert.equal(banner.memoryReference, '0x6000');
+});
+
+test('declines a string whose length the local buffer could not hold', async () => {
+	// _M_p points inside the object - the string is short - yet the length
+	// field claims 99 characters. Trusting it would invent text out of stack
+	// noise, so the raw members are shown instead.
+	const scratch = await local('scratch');
+	assert.equal(scratch.value, 'error: summary string parsing error');
+
+	const children = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: scratch.variablesReference,
+	});
+	assert.deepEqual(children.body.variables.map((v) => v.name), ['_M_dataplus']);
+});
+
+test('watch expressions go through the same formatters as the Variables view', async () => {
+	const frameId = await topFrameId();
+
+	const watch = await client.send<DebugProtocol.EvaluateResponse>('evaluate', {
+		expression: 'scores', frameId, context: 'watch',
+	});
+	assert.equal(watch.body.result, '{ size=4 }');
+	assert.equal(watch.body.indexedVariables, 4);
+	assert.equal(watch.body.memoryReference, '0x2000');
+	assert.ok(watch.body.variablesReference > 0, 'a watched vector should expand');
+
+	// And it expands to the same synthetic children, not to _Vector_base.
+	const children = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: watch.body.variablesReference,
+	});
+	assert.deepEqual(children.body.variables.map((v) => v.name), ['[0]', '[1]', '[2]', '[3]']);
+});
+
+test('hovers are formatted too', async () => {
+	const frameId = await topFrameId();
+	const hover = await client.send<DebugProtocol.EvaluateResponse>('evaluate', {
+		expression: 'label', frameId, context: 'hover',
+	});
+	assert.equal(hover.body.result, '"hello ascend"');
+});
+
+test('the Tensor Inspector pipeline decodes a window read over DAP', async () => {
+	// Exactly what the inspector does, minus the webview: ask the adapter for
+	// a window, then decode it with the shape and type the user picked. The
+	// fake serves bytes 0x00..0x0f at 0x2000, so a 4x4 of uint8 should come
+	// back as four rows counting up.
+	const shape = [4, 4];
+	const response = await client.send<DebugProtocol.ReadMemoryResponse>('readMemory', {
+		memoryReference: '0x2000',
+		offset: 0,
+		count: shapeElements(shape) * 1,
+	});
+	assert.ok(response.success, `readMemory failed: ${response.message}`);
+
+	const bytes = Buffer.from(response.body!.data!, 'base64');
+	const values = decodeTensor(bytes, 'uint8', shapeElements(shape));
+	assert.deepEqual(values, [...Array(16).keys()]);
+
+	const { rows, columns } = gridShape(shape);
+	assert.deepEqual({ rows, columns }, { rows: 4, columns: 4 });
+	// The third row of the grid, as the cells would read.
+	const third = values.slice(2 * columns, 3 * columns).map((v) => formatValue(v, 'uint8'));
+	assert.deepEqual(third, ['8', '9', '10', '11']);
+});
+
+test('the same window decodes differently when the type changes', async () => {
+	// 16 bytes is 8 float16s or 4 float32s; the inspector re-reads with the
+	// stride the type implies rather than reinterpreting a fixed count.
+	const response = await client.send<DebugProtocol.ReadMemoryResponse>('readMemory', {
+		memoryReference: '0x2000', offset: 0, count: 16,
+	});
+	const bytes = Buffer.from(response.body!.data!, 'base64');
+
+	assert.equal(decodeTensor(bytes, 'float16', 8).length, 8);
+	assert.equal(decodeTensor(bytes, 'float32', 4).length, 4);
+	// 0x0100 as a half is a subnormal, which is what these bytes really are.
+	assert.equal(decodeTensor(bytes, 'float16', 8)[0], 256 * 2 ** -24);
 });
 
 /** One local by name, re-read from a fresh scope each time. */

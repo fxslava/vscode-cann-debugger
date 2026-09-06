@@ -1,0 +1,190 @@
+/* Tensor Inspector - a structured 2-D view of NPU memory. Styled entirely
+   from theme tokens so the grid matches the editor it sits next to. */
+
+body {
+	padding: 10px 12px 16px;
+	font-family: var(--vscode-font-family);
+	font-size: var(--vscode-font-size);
+	color: var(--vscode-foreground);
+	background: transparent;
+}
+
+.toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-end;
+	gap: 8px;
+	margin-bottom: 8px;
+}
+
+.field {
+	margin-bottom: 4px;
+}
+
+.field.grow {
+	flex: 1 1 220px;
+	min-width: 160px;
+}
+
+.field.narrow {
+	width: 86px;
+}
+
+.field > label {
+	display: block;
+	margin-bottom: 3px;
+	font-size: 0.9em;
+	color: var(--vscode-descriptionForeground);
+}
+
+.field.checkbox {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-bottom: 10px;
+}
+
+.field.checkbox > label {
+	margin-bottom: 0;
+	font-size: 0.9em;
+}
+
+input[type='text'],
+select {
+	box-sizing: border-box;
+	width: 100%;
+	padding: 3px 6px;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 2px;
+	font-family: inherit;
+	font-size: inherit;
+}
+
+input[type='text']:focus,
+select:focus {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+button {
+	padding: 4px 14px;
+	color: var(--vscode-button-foreground);
+	background: var(--vscode-button-background);
+	border: none;
+	border-radius: 2px;
+	font-family: inherit;
+	font-size: inherit;
+	cursor: pointer;
+}
+
+button:hover {
+	background: var(--vscode-button-hoverBackground);
+}
+
+button:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+
+.message {
+	margin: 8px 0;
+	padding: 6px 10px;
+	border-radius: 2px;
+	background: var(--vscode-inputValidation-errorBackground);
+	border: 1px solid var(--vscode-inputValidation-errorBorder);
+	color: var(--vscode-foreground);
+}
+
+.message.info {
+	background: var(--vscode-inputValidation-infoBackground);
+	border-color: var(--vscode-inputValidation-infoBorder);
+}
+
+.stats {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 14px;
+	margin: 8px 0;
+	font-size: 0.9em;
+	color: var(--vscode-descriptionForeground);
+}
+
+.stats b {
+	font-weight: 600;
+	color: var(--vscode-foreground);
+	font-variant-numeric: tabular-nums;
+}
+
+.stats .warn b {
+	color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+/* The grid scrolls on its own; the page never scrolls sideways. */
+.grid-host {
+	overflow: auto;
+	max-height: calc(100vh - 190px);
+	border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+	border-radius: 2px;
+}
+
+.hint {
+	margin: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+table.tensor {
+	border-collapse: collapse;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: var(--vscode-editor-font-size, 12px);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+table.tensor th,
+table.tensor td {
+	padding: 2px 8px;
+	text-align: right;
+	border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+}
+
+/* Row and column headers stay put while the tensor scrolls under them. */
+table.tensor thead th {
+	position: sticky;
+	top: 0;
+	z-index: 2;
+	background: var(--vscode-editor-background);
+	color: var(--vscode-descriptionForeground);
+	font-weight: 600;
+}
+
+table.tensor tbody th {
+	position: sticky;
+	left: 0;
+	z-index: 1;
+	background: var(--vscode-editor-background);
+	color: var(--vscode-descriptionForeground);
+	font-weight: 600;
+	text-align: right;
+}
+
+table.tensor thead th:first-child {
+	left: 0;
+	z-index: 3;
+}
+
+table.tensor td.special {
+	color: var(--vscode-editorWarning-foreground, #d19a66);
+	font-weight: 600;
+}
+
+table.tensor td.missing {
+	color: var(--vscode-descriptionForeground);
+	opacity: 0.6;
+}
+
+table.tensor td.hot {
+	/* Heat is painted as a background tint; the text keeps editor contrast. */
+	color: var(--vscode-editor-foreground);
+}

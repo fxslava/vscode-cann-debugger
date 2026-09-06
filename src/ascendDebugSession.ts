@@ -1066,6 +1066,25 @@ export class AscendDebugSession extends LoggingDebugSession {
 	 * Synthetic children
 	 * ------------------------------------------------------------------ */
 
+	/**
+	 * inspect(), with the guarantee that a formatter cannot throw its way into
+	 * a failed request. A formatter that blows up on one value should cost
+	 * that value its nice rendering, nothing more.
+	 */
+	private async inspectSafely(
+		formatter: ITypeFormatter,
+		frame: FrameRef,
+		expression: string,
+		type: string,
+	): Promise<FormatterView | undefined> {
+		try {
+			return await formatter.inspect(this.formatterContext(frame), expression, type);
+		} catch (err) {
+			logger.verbose(`formatter ${formatter.name} failed on ${expression}: ${(err as Error).message}`);
+			return undefined;
+		}
+	}
+
 	/** A formatter's window onto the debugger, bound to one frame. */
 	private formatterContext(frame: FrameRef): FormatterContext {
 		return {
@@ -1102,14 +1121,7 @@ export class AscendDebugSession extends LoggingDebugSession {
 			return undefined;
 		}
 
-		let view: FormatterView | undefined;
-		try {
-			view = await formatter.inspect(this.formatterContext(frame), pathExpr, varobj.type);
-		} catch (err) {
-			// A formatter must never be able to take down the Variables view.
-			logger.verbose(`formatter ${formatter.name} failed on ${pathExpr}: ${(err as Error).message}`);
-			return undefined;
-		}
+		const view = await this.inspectSafely(formatter, frame, pathExpr, varobj.type);
 		if (!view) {
 			return undefined;
 		}
@@ -1219,13 +1231,9 @@ export class AscendDebugSession extends LoggingDebugSession {
 
 		const formatter = this.formatters.find(varobj.type);
 		if (formatter) {
-			try {
-				const view = await formatter.inspect(this.formatterContext(frame), expression, varobj.type);
-				if (view) {
-					return { kind: 'formatted', formatter, view, frame };
-				}
-			} catch {
-				/* fall through to the debugger's own children */
+			const view = await this.inspectSafely(formatter, frame, expression, varobj.type);
+			if (view) {
+				return { kind: 'formatted', formatter, view, frame };
 			}
 		}
 		return { kind: 'varobj', varobj, frame };
@@ -1421,6 +1429,30 @@ export class AscendDebugSession extends LoggingDebugSession {
 
 		try {
 			const varobj = await this.varManager.create(args.expression, threadId, level);
+			const frameRef: FrameRef = { threadId, level };
+
+			// Watches and hovers go through the same formatters as the
+			// Variables view: a std::vector that reads "{ size=8 }" in one
+			// place and "error: summary string parsing error" in another is
+			// worse than either answer on its own.
+			const formatter = this.formatters.find(varobj.type);
+			if (formatter) {
+				const view = await this.inspectSafely(formatter, frameRef, args.expression, varobj.type);
+				if (view) {
+					response.body = {
+						result: view.value,
+						type: varobj.type || undefined,
+						variablesReference: view.indexedVariables > 0
+							? this.variableHandles.create({ kind: 'formatted', formatter, view, frame: frameRef })
+							: 0,
+						indexedVariables: view.indexedVariables || undefined,
+						memoryReference: view.memoryReference,
+					};
+					this.sendResponse(response);
+					return;
+				}
+			}
+
 			const shape = classifyType(varobj.type);
 			const expandable = varobj.numchild > 0 || varobj.hasMore;
 

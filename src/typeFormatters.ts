@@ -24,7 +24,7 @@
 
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { MiConnection } from './mi/miConnection';
-import { evaluateInteger, VarObjectManager } from './varObjects';
+import { evaluateInteger, readMemoryBytes, VarObjectManager } from './varObjects';
 
 /** Everything a formatter needs to talk to the debugger and to the session. */
 export interface FormatterContext {
@@ -94,6 +94,7 @@ export class TypeFormatterRegistry {
 export function createDefaultFormatterRegistry(): TypeFormatterRegistry {
 	const registry = new TypeFormatterRegistry();
 	registry.register(new StdVectorFormatter());
+	registry.register(new StdStringFormatter());
 	return registry;
 }
 
@@ -290,6 +291,175 @@ export class StdVectorFormatter implements ITypeFormatter {
 /** `*((x)._M_impl._M_start + 7)` - valid to re-evaluate, so watches work. */
 function elementExpression(state: VectorState, index: number): string {
 	return `*((${state.expression})._M_impl._M_start + ${index})`;
+}
+
+/* -------------------------------------------------------------------------
+ * std::string
+ * ---------------------------------------------------------------------- */
+
+interface StringState {
+	expression: string;
+	/** Where the characters live - the heap, or the object itself under SSO. */
+	dataAddress: bigint;
+	/** Byte length the string claims, before any read clamp. */
+	length: number;
+	/** Already escaped and quoted, ready to show. */
+	display: string;
+}
+
+/**
+ * A libstdc++ (C++11 ABI) string is a pointer, a length, and a 16-byte union:
+ *
+ *   _M_dataplus._M_p     char*        always points at the characters
+ *   _M_string_length     size_type
+ *   union { _M_local_buf[16]; _M_allocated_capacity; }
+ *
+ * Short String Optimization means anything up to 15 characters lives in
+ * `_M_local_buf` inside the object, and longer strings live on the heap - but
+ * libstdc++ maintains `_M_p` so that it points at the characters either way.
+ * So the read path is the same for both, and there is no branch to get wrong.
+ *
+ * What the SSO distinction actually buys is a validity check. `_M_p` pointing
+ * into the object's own footprint means the string is short, and a short
+ * string claiming more than 15 characters is not a live string at all - it is
+ * an uninitialised local, and the honest answer is to decline and let the raw
+ * members show rather than to read a garbage length off the stack.
+ */
+export class StdStringFormatter implements ITypeFormatter {
+	public readonly name = 'std::string';
+
+	/** libstdc++'s _S_local_capacity: 15 characters plus the terminator. */
+	public static readonly LOCAL_CAPACITY = 15;
+	/** Read at most this much: a row in the Variables view is not a file viewer. */
+	private static readonly MAX_TEXT = 4096;
+	/** Past this, the length field is not a length. */
+	private static readonly MAX_PLAUSIBLE = 64n * 1024n * 1024n;
+
+	public match(type: string): boolean {
+		const bare = stripCvRef(type);
+		if (/^std::(?:__\w+::)?string$/.test(bare)) {
+			return true;
+		}
+		if (!/^std::(?:__\w+::)?basic_string\s*</.test(bare)) {
+			return false;
+		}
+		// Byte strings only: wstring and u16/u32string need different decoding.
+		const charType = firstTemplateArgument(bare);
+		return charType !== undefined && stripCvRef(charType) === 'char';
+	}
+
+	public async inspect(
+		ctx: FormatterContext,
+		expression: string,
+	): Promise<FormatterView | undefined> {
+		const [pointer, length, objectAddress, objectSize] = await Promise.all([
+			evaluateInteger(ctx.mi,
+				`(unsigned long long)(${expression})._M_dataplus._M_p`, ctx.threadId, ctx.frameLevel),
+			evaluateInteger(ctx.mi,
+				`(unsigned long long)(${expression})._M_string_length`, ctx.threadId, ctx.frameLevel),
+			evaluateInteger(ctx.mi,
+				`(unsigned long long)&(${expression})`, ctx.threadId, ctx.frameLevel),
+			evaluateInteger(ctx.mi, `sizeof(${expression})`, ctx.threadId, ctx.frameLevel),
+		]);
+
+		// No _M_dataplus means this is not the C++11 ABI - a COW string from an
+		// older libstdc++, or a type we mis-claimed. Let the caller fall back.
+		if (pointer === undefined || length === undefined) {
+			return undefined;
+		}
+		if (pointer === 0n || length < 0n || length > StdStringFormatter.MAX_PLAUSIBLE) {
+			return undefined;
+		}
+
+		// `&object` and `sizeof` can both fail for a value with no address, so
+		// the SSO check is best-effort: when we cannot locate the object we
+		// simply do not get to apply it.
+		const isSso = objectAddress !== undefined && objectSize !== undefined &&
+			pointer >= objectAddress && pointer < objectAddress + objectSize;
+		if (isSso && length > BigInt(StdStringFormatter.LOCAL_CAPACITY)) {
+			return undefined;
+		}
+
+		const claimed = Number(length);
+		const bytes = await readMemoryBytes(
+			ctx.mi, pointer, Math.min(claimed, StdStringFormatter.MAX_TEXT));
+		if (bytes === undefined) {
+			return undefined;
+		}
+
+		const display = quoteText(decodeText(bytes), claimed - bytes.length);
+		const state: StringState = { expression, dataAddress: pointer, length: claimed, display };
+
+		return {
+			value: display,
+			// One child carrying the text: the value column truncates, this
+			// does not, so a long string stays readable and copyable.
+			indexedVariables: claimed > 0 ? 1 : 0,
+			// The characters, not the string object's header.
+			memoryReference: `0x${pointer.toString(16)}`,
+			state,
+		};
+	}
+
+	public async getChildren(
+		_ctx: FormatterContext,
+		view: FormatterView,
+		start: number,
+		count: number,
+	): Promise<DebugProtocol.Variable[]> {
+		const state = view.state as StringState;
+		if (start > 0 || count <= 0 || state.length === 0) {
+			return [];
+		}
+		return [{
+			name: '[text]',
+			value: state.display,
+			type: `char [${state.length}]`,
+			// Re-evaluatable, so the element can be watched on its own.
+			evaluateName: `(${state.expression})._M_dataplus._M_p`,
+			variablesReference: 0,
+			memoryReference: `0x${state.dataAddress.toString(16)}`,
+		}];
+	}
+}
+
+/**
+ * Bytes to text. A std::string holds bytes, not characters, and most of them
+ * are UTF-8 in practice - but a tensor label read out of a half-initialised
+ * buffer is not, and turning those bytes into replacement characters would
+ * hide what is actually in memory. So: UTF-8 when the bytes really are UTF-8,
+ * byte-for-byte otherwise.
+ */
+export function decodeText(bytes: Buffer): string {
+	const utf8 = bytes.toString('utf8');
+	return Buffer.from(utf8, 'utf8').equals(bytes) ? utf8 : bytes.toString('latin1');
+}
+
+/** `"hello"`, or `"hello"... (9000 chars)` when the read was clamped. */
+export function quoteText(text: string, omitted: number): string {
+	const quoted = `"${escapeCString(text)}"`;
+	return omitted > 0 ? `${quoted}... (${text.length + omitted} chars)` : quoted;
+}
+
+/** C-style escaping, so a newline in a string does not break the row. */
+export function escapeCString(text: string): string {
+	let out = '';
+	for (const ch of text) {
+		switch (ch) {
+			case '\\': out += '\\\\'; break;
+			case '"': out += '\\"'; break;
+			case '\n': out += '\\n'; break;
+			case '\r': out += '\\r'; break;
+			case '\t': out += '\\t'; break;
+			default: {
+				const code = ch.codePointAt(0) ?? 0;
+				out += code < 0x20 || code === 0x7f
+					? `\\x${code.toString(16).padStart(2, '0')}`
+					: ch;
+			}
+		}
+	}
+	return out;
 }
 
 /* -------------------------------------------------------------------------
