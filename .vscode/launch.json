@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "D:\\Projects\\vllm-ascend"
+      ],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "npm: compile"
+    },
+    {
+      "name": "Debug Adapter (server mode)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/debugAdapter.js",
+      "args": ["--server=4711"],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "npm: compile"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Extension + Adapter",
+      "configurations": ["Run Extension", "Debug Adapter (server mode)"]
+    }
+  ]
+}

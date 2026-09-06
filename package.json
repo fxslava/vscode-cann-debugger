@@ -1,0 +1,659 @@
+{
+  "name": "vscode-cann-debugger",
+  "displayName": "Ascend C / CANN Debugger",
+  "description": "Visual Studio-class debugging for bare-metal Ascend C operators via GDB/MI, inside WSL or a CANN Docker container.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "keywords": [
+    "ascend",
+    "cann",
+    "npu",
+    "gdb",
+    "msdebug",
+    "docker",
+    "wsl",
+    "bare-metal"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onDebugResolve:ascend-gdb"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test \"out/test/**/*.test.js\""
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "^1.68.0",
+    "@vscode/debugprotocol": "^1.68.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.86.0",
+    "typescript": "^5.7.2"
+  },
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "c"
+      },
+      {
+        "language": "cpp"
+      },
+      {
+        "language": "ascendc"
+      }
+    ],
+    "commands": [
+      {
+        "command": "ascend-gdb.viewNpuMemory",
+        "title": "View NPU Memory Region...",
+        "category": "Ascend"
+      },
+      {
+        "command": "ascend-gdb.sendMiCommand",
+        "title": "Send Raw GDB/MI Command...",
+        "category": "Ascend"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ascend-gdb.viewNpuMemory",
+          "when": "debugState == stopped && debugType == ascend-gdb"
+        },
+        {
+          "command": "ascend-gdb.sendMiCommand",
+          "when": "inDebugMode && debugType == ascend-gdb"
+        }
+      ]
+    },
+    "debuggers": [
+      {
+        "type": "ascend-gdb",
+        "label": "Ascend C (CANN / GDB-MI via WSL or Docker)",
+        "program": "./out/debugAdapter.js",
+        "runtime": "node",
+        "languages": [
+          "c",
+          "cpp",
+          "ascendc"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path to the executable to debug. May be a Windows path (D:\\...) or a WSL path (/mnt/d/...); it is translated automatically.",
+                "default": "${workspaceFolder}/build/test_kernel"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command line arguments passed to the program.",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory of the debuggee (Windows or WSL path).",
+                "default": "${workspaceFolder}"
+              },
+              "environment": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "description": "Environment variables exported inside WSL before the debugger starts.",
+                "default": []
+              },
+              "gdbPath": {
+                "type": "string",
+                "description": "Debugger executable inside the guest/container. For CANN 8.5 containers this is msdebug-mi (the MI driver over LLDB), e.g. /usr/local/Ascend/cann-8.5.0/tools/msdebug/bin/msdebug-mi. Also accepts ascend-gdb or any GDB build.",
+                "default": "ascend-gdb"
+              },
+              "gdbArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra arguments appended to the debugger command line.",
+                "default": []
+              },
+              "miMode": {
+                "type": "string",
+                "enum": [
+                  "mi2",
+                  "mi3",
+                  "mi"
+                ],
+                "description": "GDB machine interface level requested via --interpreter=.",
+                "default": "mi2"
+              },
+              "execution": {
+                "type": "object",
+                "description": "Where the debugger process runs.",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "wsl",
+                      "docker",
+                      "native"
+                    ],
+                    "enumDescriptions": [
+                      "Run the debugger inside a WSL 2 distribution.",
+                      "Run the debugger inside a running Docker container (optionally reached through WSL).",
+                      "Run the debugger directly on the host, with no boundary to cross."
+                    ],
+                    "description": "Execution mode. Defaults to wsl (or native when wsl.enabled is false).",
+                    "default": "docker"
+                  },
+                  "docker": {
+                    "type": "object",
+                    "description": "Container settings, used when mode is docker.",
+                    "properties": {
+                      "containerName": {
+                        "type": "string",
+                        "description": "Name or id of the running container, e.g. ascend-suites.",
+                        "default": "ascend-suites"
+                      },
+                      "dockerPath": {
+                        "type": "string",
+                        "description": "Path to the docker CLI. Resolved inside the WSL guest when viaWsl is true.",
+                        "default": "docker"
+                      },
+                      "dockerArgs": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Extra arguments inserted into `docker exec`, e.g. [\"-e\",\"ASCEND_GLOBAL_LOG_LEVEL=1\"].",
+                        "default": []
+                      },
+                      "user": {
+                        "type": "string",
+                        "description": "User for `docker exec -u`.",
+                        "default": ""
+                      },
+                      "workdir": {
+                        "type": "string",
+                        "description": "Directory for `docker exec -w`. Usually unset; `cwd` already cd's inside the guest shell.",
+                        "default": ""
+                      },
+                      "viaWsl": {
+                        "type": "boolean",
+                        "description": "Run the docker CLI through wsl.exe. Required when the Docker engine lives inside the distro rather than on Windows (Docker Desktop).",
+                        "default": true
+                      }
+                    },
+                    "default": {
+                      "containerName": "ascend-suites",
+                      "viaWsl": true
+                    }
+                  }
+                },
+                "default": {
+                  "mode": "docker",
+                  "docker": {
+                    "containerName": "ascend-suites",
+                    "viaWsl": true
+                  }
+                }
+              },
+              "wsl": {
+                "type": "object",
+                "description": "How to reach the WSL guest from the Windows host.",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "description": "Spawn the debugger through wsl.exe. Set false to run a debugger native to the host.",
+                    "default": true
+                  },
+                  "distro": {
+                    "type": "string",
+                    "description": "WSL distribution name (wsl.exe -d). Empty means the default distribution.",
+                    "default": ""
+                  },
+                  "user": {
+                    "type": "string",
+                    "description": "WSL user (wsl.exe -u). Empty means the distribution default user.",
+                    "default": ""
+                  },
+                  "wslPath": {
+                    "type": "string",
+                    "description": "Path to wsl.exe.",
+                    "default": "wsl.exe"
+                  },
+                  "shell": {
+                    "type": "string",
+                    "description": "Login shell used inside the guest to source the CANN environment.",
+                    "default": "/bin/bash"
+                  }
+                },
+                "default": {
+                  "enabled": true,
+                  "distro": ""
+                }
+              },
+              "setupScript": {
+                "type": "string",
+                "description": "Shell script sourced inside WSL before launching the debugger, typically the CANN set_env.sh.",
+                "default": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+              },
+              "setupCommands": {
+                "type": "array",
+                "description": "GDB/MI or console commands executed after the debugger starts, before the program is loaded.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "ignoreFailures": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "default": [
+                  {
+                    "text": "-gdb-set print pretty on",
+                    "ignoreFailures": true
+                  },
+                  {
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                  }
+                ]
+              },
+              "postRemoteConnectCommands": {
+                "type": "array",
+                "description": "Commands executed right after connecting to miDebuggerServerAddress (simulator bring-up).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "ignoreFailures": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "default": []
+              },
+              "miDebuggerServerAddress": {
+                "type": "string",
+                "description": "host:port of a gdbserver / CANN simulator stub. When set, the adapter issues -target-select remote instead of running the program locally.",
+                "default": ""
+              },
+              "sourceFileMap": {
+                "type": "object",
+                "description": "Explicit path mappings applied before the generic /mnt/<drive> rule. Keys are debugger (WSL) prefixes, values are host (Windows) prefixes.",
+                "default": {}
+              },
+              "pathTranslation": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "on",
+                  "off"
+                ],
+                "enumDescriptions": [
+                  "Translate whenever the debugger is not a plain host-native process (under WSL, or against a remote gdbserver).",
+                  "Always translate Windows paths to guest paths and back.",
+                  "Never translate; the debugger sees the same filesystem as the UI."
+                ],
+                "description": "Controls Windows <-> guest path translation for breakpoints and stack frames.",
+                "default": "auto"
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "description": "Break as soon as the entry function is reached.",
+                "default": false
+              },
+              "entryFunction": {
+                "type": "string",
+                "description": "Symbol used for stopAtEntry.",
+                "default": "main"
+              },
+              "memoryReferences": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "all",
+                  "off"
+                ],
+                "enumDescriptions": [
+                  "Attach memoryReference to pointers, arrays and aggregates only (cheapest useful default).",
+                  "Attach memoryReference to every addressable variable (one extra MI round-trip per variable).",
+                  "Never attach memoryReference."
+                ],
+                "description": "Controls which variables get a memoryReference, and therefore a View Binary Data entry.",
+                "default": "auto"
+              },
+              "npuMemoryRegions": {
+                "type": "array",
+                "description": "Named NPU memory windows surfaced as a dedicated NPU Memory scope so they can be opened in the Hex Editor.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "address"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "Display name, e.g. UB, L1, L0A, L0C, GM."
+                    },
+                    "address": {
+                      "type": "string",
+                      "description": "Base address as a hex literal or a GDB expression."
+                    },
+                    "size": {
+                      "type": "number",
+                      "description": "Window size in bytes."
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "default": []
+              },
+              "logging": {
+                "type": "object",
+                "properties": {
+                  "engineLogging": {
+                    "type": "boolean",
+                    "description": "Echo every GDB/MI command and response to the Debug Console.",
+                    "default": false
+                  },
+                  "programOutput": {
+                    "type": "boolean",
+                    "description": "Forward debuggee stdout/stderr to the Debug Console.",
+                    "default": true
+                  },
+                  "trace": {
+                    "type": "boolean",
+                    "description": "Echo every DAP message. Very noisy; only useful when working on the adapter itself.",
+                    "default": false
+                  }
+                },
+                "default": {
+                  "engineLogging": false,
+                  "programOutput": true,
+                  "trace": false
+                }
+              }
+            }
+          },
+          "attach": {
+            "required": [],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Executable providing symbols for the attached process or simulator."
+              },
+              "processId": {
+                "type": "string",
+                "description": "PID inside the WSL guest to attach to.",
+                "default": ""
+              },
+              "miDebuggerServerAddress": {
+                "type": "string",
+                "description": "host:port of a gdbserver / CANN simulator stub to attach to.",
+                "default": "localhost:1234"
+              },
+              "cwd": {
+                "type": "string",
+                "default": "${workspaceFolder}"
+              },
+              "gdbPath": {
+                "type": "string",
+                "default": "ascend-gdb",
+                "description": "Debugger executable inside the guest/container. For CANN 8.5 containers this is msdebug-mi (the MI driver over LLDB), e.g. /usr/local/Ascend/cann-8.5.0/tools/msdebug/bin/msdebug-mi. Also accepts ascend-gdb or any GDB build."
+              },
+              "gdbArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "miMode": {
+                "type": "string",
+                "enum": [
+                  "mi2",
+                  "mi3",
+                  "mi"
+                ],
+                "default": "mi2"
+              },
+              "execution": {
+                "type": "object",
+                "description": "Where the debugger process runs.",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "wsl",
+                      "docker",
+                      "native"
+                    ],
+                    "enumDescriptions": [
+                      "Run the debugger inside a WSL 2 distribution.",
+                      "Run the debugger inside a running Docker container (optionally reached through WSL).",
+                      "Run the debugger directly on the host, with no boundary to cross."
+                    ],
+                    "description": "Execution mode. Defaults to wsl (or native when wsl.enabled is false).",
+                    "default": "docker"
+                  },
+                  "docker": {
+                    "type": "object",
+                    "description": "Container settings, used when mode is docker.",
+                    "properties": {
+                      "containerName": {
+                        "type": "string",
+                        "description": "Name or id of the running container, e.g. ascend-suites.",
+                        "default": "ascend-suites"
+                      },
+                      "dockerPath": {
+                        "type": "string",
+                        "description": "Path to the docker CLI. Resolved inside the WSL guest when viaWsl is true.",
+                        "default": "docker"
+                      },
+                      "dockerArgs": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Extra arguments inserted into `docker exec`, e.g. [\"-e\",\"ASCEND_GLOBAL_LOG_LEVEL=1\"].",
+                        "default": []
+                      },
+                      "user": {
+                        "type": "string",
+                        "description": "User for `docker exec -u`.",
+                        "default": ""
+                      },
+                      "workdir": {
+                        "type": "string",
+                        "description": "Directory for `docker exec -w`. Usually unset; `cwd` already cd's inside the guest shell.",
+                        "default": ""
+                      },
+                      "viaWsl": {
+                        "type": "boolean",
+                        "description": "Run the docker CLI through wsl.exe. Required when the Docker engine lives inside the distro rather than on Windows (Docker Desktop).",
+                        "default": true
+                      }
+                    },
+                    "default": {
+                      "containerName": "ascend-suites",
+                      "viaWsl": true
+                    }
+                  }
+                },
+                "default": {
+                  "mode": "docker",
+                  "docker": {
+                    "containerName": "ascend-suites",
+                    "viaWsl": true
+                  }
+                }
+              },
+              "wsl": {
+                "type": "object",
+                "default": {
+                  "enabled": true,
+                  "distro": ""
+                }
+              },
+              "setupScript": {
+                "type": "string",
+                "default": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+              },
+              "setupCommands": {
+                "type": "array",
+                "default": []
+              },
+              "postRemoteConnectCommands": {
+                "type": "array",
+                "default": []
+              },
+              "sourceFileMap": {
+                "type": "object",
+                "default": {}
+              },
+              "pathTranslation": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "on",
+                  "off"
+                ],
+                "enumDescriptions": [
+                  "Translate whenever the debugger is not a plain host-native process (under WSL, or against a remote gdbserver).",
+                  "Always translate Windows paths to guest paths and back.",
+                  "Never translate; the debugger sees the same filesystem as the UI."
+                ],
+                "description": "Controls Windows <-> guest path translation for breakpoints and stack frames.",
+                "default": "auto"
+              },
+              "npuMemoryRegions": {
+                "type": "array",
+                "default": []
+              },
+              "memoryReferences": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "all",
+                  "off"
+                ],
+                "default": "auto"
+              },
+              "logging": {
+                "type": "object",
+                "default": {
+                  "engineLogging": false,
+                  "programOutput": true
+                }
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "ascend-gdb",
+            "request": "launch",
+            "name": "Ascend C: debug kernel test (WSL)",
+            "program": "${workspaceFolder}/build/test_kernel",
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": true,
+            "wsl": {
+              "enabled": true,
+              "distro": "Ubuntu-22.04"
+            },
+            "gdbPath": "ascend-gdb",
+            "setupScript": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Ascend C: Launch bare-metal kernel in WSL",
+            "description": "Run an Ascend C operator test under ascend-gdb inside WSL.",
+            "body": {
+              "type": "ascend-gdb",
+              "request": "launch",
+              "name": "Ascend C: ${1:test_kernel}",
+              "program": "^\"\\${workspaceFolder}/build/${1:test_kernel}\"",
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "stopAtEntry": true,
+              "wsl": {
+                "enabled": true,
+                "distro": "${2:Ubuntu-22.04}"
+              },
+              "gdbPath": "ascend-gdb",
+              "setupScript": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+              "npuMemoryRegions": [
+                {
+                  "name": "UB",
+                  "address": "0x0",
+                  "size": 262144,
+                  "description": "Unified Buffer"
+                },
+                {
+                  "name": "L1",
+                  "address": "0x0",
+                  "size": 1048576,
+                  "description": "L1 Buffer"
+                }
+              ]
+            }
+          },
+          {
+            "label": "Ascend C: Attach to CANN simulator stub",
+            "description": "Connect to a running gdbserver / camodel stub.",
+            "body": {
+              "type": "ascend-gdb",
+              "request": "attach",
+              "name": "Ascend C: attach simulator",
+              "program": "^\"\\${workspaceFolder}/build/${1:test_kernel}\"",
+              "miDebuggerServerAddress": "localhost:${2:1234}",
+              "wsl": {
+                "enabled": true,
+                "distro": "${3:Ubuntu-22.04}"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
