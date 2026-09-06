@@ -8,9 +8,11 @@ import { test } from 'node:test';
 import {
 	annotateRegisterValue,
 	categorizeRegister,
+	formatRegisterValue,
 	groupRegisters,
 	parseRegisterBinding,
 	REGISTER_GROUPS,
+	renderRegisterValue,
 } from '../registers';
 
 /* -------------------------------------------------------------------------
@@ -117,4 +119,63 @@ test('annotates a register with the locals it holds', () => {
 
 test('a register holding nothing reads exactly as before', () => {
 	assert.equal(annotateRegisterValue('0x0', []), '0x0');
+});
+
+/* -------------------------------------------------------------------------
+ * Hex and decimal
+ * ---------------------------------------------------------------------- */
+
+test('shows a scalar register as both hex and decimal', () => {
+	// Hex alone is right for an address and useless for a loop counter.
+	assert.equal(formatRegisterValue('0x2a'), '0x0000002A (42)');
+	assert.equal(formatRegisterValue('0x0'), '0x00000000 (0)');
+	assert.equal(formatRegisterValue('0x2000'), '0x00002000 (8192)');
+	// Padded to a fixed width so a column of registers lines up.
+	assert.equal(formatRegisterValue('0xff'), '0x000000FF (255)');
+});
+
+test('widens past 32 bits rather than truncating', () => {
+	assert.equal(formatRegisterValue('0x7ffd12345678'), '0x00007FFD12345678 (140724908873336)');
+	// The full 64-bit pattern, unsigned: the literal value of the bits. Signed
+	// would need a register width that MI never reports.
+	assert.equal(formatRegisterValue('0xffffffffffffffff'),
+		'0xFFFFFFFFFFFFFFFF (18446744073709551615)');
+});
+
+test('leaves anything that is not a plain scalar alone', () => {
+	// A vector register's full contents: a 128-bit decimal helps nobody.
+	const wide = '0x000102030405060708090a0b0c0d0e0f';
+	assert.equal(formatRegisterValue(wide), wide.toUpperCase().replace('0X', '0x'));
+	// GDB's structured rendering of a vector file, and a float, pass through.
+	assert.equal(formatRegisterValue('{s = {1, 2}, d = {3}}'), '{s = {1, 2}, d = {3}}');
+	assert.equal(formatRegisterValue('1.5'), '1.5');
+	assert.equal(formatRegisterValue(''), '');
+});
+
+/* -------------------------------------------------------------------------
+ * Change marking
+ * ---------------------------------------------------------------------- */
+
+test('marks what a register last held', () => {
+	assert.equal(renderRegisterValue('0x2a', '0x28'), '0x0000002A (42) [was 0x28]');
+});
+
+test('says nothing about a register that has never moved', () => {
+	// The first stop has nothing to compare against.
+	assert.equal(renderRegisterValue('0x2a', undefined), '0x0000002A (42)');
+	// A marker equal to the current value would say nothing worth reading.
+	assert.equal(renderRegisterValue('0x2a', '0x2a'), '0x0000002A (42)');
+});
+
+test('the marker holds still while the register does', () => {
+	// The same last-different value renders byte-identically however many
+	// stops go by, which is what stops VS Code highlighting it again.
+	assert.equal(renderRegisterValue('0x2a', '0x28'), renderRegisterValue('0x2a', '0x28'));
+});
+
+test('a moved register that also holds a local says both', () => {
+	// The marker comes first: when stepping, that is what is being looked for.
+	assert.equal(
+		renderRegisterValue('0x2a', '0x28', ['count']),
+		'0x0000002A (42) [was 0x28] [mapped to: count]');
 });

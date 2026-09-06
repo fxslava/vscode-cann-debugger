@@ -47,6 +47,15 @@ export class DapClient {
 		if (already) {
 			return Promise.resolve(already);
 		}
+		return this.waitForNextEvent(event, timeoutMs);
+	}
+
+	/**
+	 * Wait for the *next* occurrence, ignoring any already seen. Stepping needs
+	 * this: the session has stopped once already, so waitForEvent('stopped')
+	 * would return that first stop immediately.
+	 */
+	public waitForNextEvent(event: string, timeoutMs = 5000): Promise<DebugProtocol.Event> {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(
 				() => reject(new Error(`Timed out waiting for "${event}" event`)), timeoutMs);

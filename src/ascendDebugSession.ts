@@ -50,12 +50,12 @@ import { MiConnection, MiError, quoteMiString } from './mi/miConnection';
 import { miArray, miList, miNumber, miString, miTuple, MiRecord } from './mi/miParser';
 import { PathMapper } from './pathMapper';
 import {
-	annotateRegisterValue,
 	categorizeRegister,
 	groupRegisters,
 	parseRegisterBinding,
 	RegisterGroup,
 	REGISTER_GROUPS,
+	renderRegisterValue,
 } from './registers';
 import { buildDebuggerSpawn, buildSignalEnv, buildSignalPrefix } from './wslLauncher';
 import {
@@ -177,6 +177,20 @@ export class AscendDebugSession extends LoggingDebugSession {
 	private registerNames?: string[];
 	/** Locals held in registers, rebuilt on each stop; see readRegisterBindings. */
 	private registerBindings?: Map<string, string[]>;
+	/**
+	 * Register values as of the previous stop, and as read during this one.
+	 * The swap happens on resume, not on read, so re-expanding the folder
+	 * twice in one stop shows the same answer both times.
+	 */
+	private registerHistory = new Map<string, string>();
+	private registerCurrent = new Map<string, string>();
+	/**
+	 * The last *different* value each register held, which is what the `[was]`
+	 * marker shows. Unlike the pair above this is never rotated: it stays put
+	 * while a register holds still, so the rendered string stays byte-identical
+	 * and VS Code does not highlight a register that did not move.
+	 */
+	private readonly registerWas = new Map<string, string>();
 	/** Cached probe result: lldb-mi lacks -data-write-memory-bytes. */
 	private supportsWriteMemoryBytes?: boolean;
 	private stoppedThreadId = 1;
@@ -570,6 +584,13 @@ export class AscendDebugSession extends LoggingDebugSession {
 
 	/** Called before every resume: varobjs and handles do not survive it. */
 	private async beforeResume(): Promise<void> {
+		// Whatever was read this stop becomes the baseline for the next one.
+		// Left alone when the user never opened the Registers view, so the
+		// comparison survives a run of steps that nobody was watching.
+		if (this.registerCurrent.size) {
+			this.registerHistory = this.registerCurrent;
+			this.registerCurrent = new Map();
+		}
 		await this.varManager.releaseAll();
 		this.resetHandles();
 	}
@@ -1417,9 +1438,22 @@ export class AscendDebugSession extends LoggingDebugSession {
 				continue;
 			}
 			const value = miString(entry['value']);
+			this.registerCurrent.set(name, value);
+
+			// Idempotent within a stop: registerHistory does not move until
+			// the next resume, so reading the folder again recomputes exactly
+			// the same marker rather than eating it.
+			const previous = this.registerHistory.get(name);
+			if (previous !== undefined && previous !== value) {
+				this.registerWas.set(name, previous);
+			}
+
 			const variable: DebugProtocol.Variable = {
+				// Stable across stops - VS Code matches variables by name to
+				// decide what to highlight, so this must not carry a handle or
+				// an index that changes every time the frame is rebuilt.
 				name,
-				value: annotateRegisterValue(value, bindings.get(name) ?? []),
+				value: renderRegisterValue(value, this.registerWas.get(name), bindings.get(name) ?? []),
 				variablesReference: 0,
 				evaluateName: `$${name}`,
 				presentationHint: { kind: 'data', attributes: ['readOnly'] },

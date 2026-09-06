@@ -90,6 +90,8 @@ const slices = new Map<string, { vector: string; first: number; length: number }
 /** Single-element varobjs, keyed by varobj name -> the expression behind it. */
 const elements = new Map<string, string>();
 let syntheticVarobjs = 0;
+/** How many steps the target has taken; x0 advances with it. */
+let steps = 0;
 
 /** The fields of a struct element, so a nested expansion has something to show. */
 function structChildren(varobj: string): string {
@@ -188,6 +190,20 @@ function handle(token: string, command: string): void {
 			out('@"AddCustom: tile 0 of 8\\n"');
 			out('kernel printf via shared stdout');
 			out('*stopped,reason="breakpoint-hit",disp="keep",bkptno="1",' +
+				`${STOP_FRAME},thread-id="1",stopped-threads="all",core="0"`);
+			prompt();
+		}, 10);
+		return;
+	}
+
+	// Stepping moves x0 on and leaves everything else alone, so a test can tell
+	// a changed register from an unchanged one.
+	if (command.startsWith('-exec-next') || command.startsWith('-exec-step')) {
+		steps++;
+		out(`${token}^running`);
+		prompt();
+		setTimeout(() => {
+			out('*stopped,reason="end-stepping-range",' +
 				`${STOP_FRAME},thread-id="1",stopped-threads="all",core="0"`);
 			prompt();
 		}, 10);
@@ -442,8 +458,11 @@ function handle(token: string, command: string): void {
 	}
 
 	if (command.startsWith('-data-list-register-values')) {
+		// x0 moves on the first step and then holds, so a test can tell a
+		// register that changed from one that only changed once.
+		const x0 = steps > 0 ? '0x2010' : '0x2000';
 		done(token,
-			'register-values=[{number="0",value="0x2000"},{number="1",value="0x0"},' +
+			`register-values=[{number="0",value="${x0}"},{number="1",value="0x0"},` +
 			'{number="2",value="0x400546"},{number="3",value="0x1234"},' +
 			'{number="4",value="0x60000000"}]');
 		return;

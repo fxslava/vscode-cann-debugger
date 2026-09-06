@@ -119,3 +119,63 @@ export function annotateRegisterValue(value: string, symbols: readonly string[])
 	}
 	return `${value} [mapped to: ${symbols.join(', ')}]`;
 }
+
+/**
+ * Show a register as both hex and decimal: `0x0000002A (42)`.
+ *
+ * GDB reports registers in hex, which is right for an address and useless for
+ * a loop counter. The hex is zero-padded to 32 or 64 bits so a column of them
+ * lines up, and the decimal is *unsigned* - the literal value of the bits.
+ * Signed would need the register's width, which MI does not report, and a
+ * guess that is wrong turns a large address into a negative number.
+ *
+ * Values that are not a plain scalar are left exactly as they came: a vector
+ * lane dump (`{s = {...}}`) or a float has nothing to gain from this.
+ */
+export function formatRegisterValue(raw: string): string {
+	const text = (raw || '').trim();
+	const match = /^0x([0-9a-fA-F]+)$/.exec(text);
+	if (!match) {
+		return text;
+	}
+
+	const digits = match[1];
+	if (digits.length > 16) {
+		// Wider than 64 bits: a vector register's full contents. A 128-bit
+		// decimal is not something anyone reads, so leave it in hex.
+		return `0x${digits.toUpperCase()}`;
+	}
+
+	const width = digits.length > 8 ? 16 : 8;
+	return `0x${digits.toUpperCase().padStart(width, '0')} (${BigInt(text).toString()})`;
+}
+
+/**
+ * The full value string for one register: formatted, marked with what it last
+ * held, and annotated with any locals living in it.
+ *
+ *   0x0000002A (42) [was 0x28] [mapped to: count]
+ *
+ * `was` is the last *different* value, not the value at the previous stop -
+ * and that distinction is the whole point. VS Code decides what to highlight
+ * by diffing the rendered string against the last one, so a marker that
+ * appeared on the stop a register changed and vanished on the next would
+ * itself look like a change, highlighting a register that had held still.
+ * Keeping the last different value pinned means the string stops changing
+ * exactly when the register does.
+ *
+ * The marker comes before the mapping because when stepping it is the thing
+ * being looked for. The old value is shown raw, as the debugger reported it:
+ * the interest is in what it was, not in reading it padded a second time.
+ */
+export function renderRegisterValue(
+	raw: string,
+	was: string | undefined,
+	symbols: readonly string[] = [],
+): string {
+	let out = formatRegisterValue(raw);
+	if (was !== undefined && was !== raw) {
+		out += ` [was ${was}]`;
+	}
+	return annotateRegisterValue(out, symbols);
+}

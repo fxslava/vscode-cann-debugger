@@ -162,7 +162,7 @@ test('registers holding addresses get a memoryReference', async () => {
 
 	// pc is not general-purpose, so it files under System.
 	const system = await registersIn('System Registers');
-	assert.match(system.get('pc')!.value, /^0x400546/);
+	assert.match(system.get('pc')!.value, /^0x00400546 \(4195654\)/);
 	assert.equal(system.has('cpsr'), true);
 	// ...and the vector file is its own folder.
 	const vectors = await registersIn('Vector Registers');
@@ -174,17 +174,52 @@ test('annotates the registers that hold a local variable', async () => {
 	// The connection a register view cannot otherwise show: a local with no
 	// address, because it lives in a register.
 	const scalars = await registersIn('Scalar Registers');
-	assert.equal(scalars.get('x0')!.value, '0x2000 [mapped to: xGm]');
+	assert.match(scalars.get('x0')!.value, /\[mapped to: xGm\]$/);
 
 	const vectors = await registersIn('Vector Registers');
-	assert.equal(vectors.get('v0')!.value, '0x1234 [mapped to: scores]');
+	assert.equal(vectors.get('v0')!.value, '0x00001234 (4660) [mapped to: scores]');
 
 	// x29 is named by every stack local's `info address` answer, but holds
 	// none of them: reading that as a binding would label it with the frame.
 	const system = await registersIn('System Registers');
 	assert.equal(/mapped to/.test(system.get('pc')!.value), false);
-	assert.equal(scalars.get('x1')!.value, '0x0');
+	assert.match(scalars.get('x1')!.value, /^0x00000000 \(0\)$/);
 });
+
+test('marks what a register last held, and keeps the marker stable', async () => {
+	// Read once so this stop's values become the baseline.
+	const before = await registersIn('Scalar Registers');
+	assert.equal(/\[was /.test(before.get('x0')!.value), false,
+		'nothing has changed yet on the first read');
+
+	// The fake moves x0 on the first step and holds it after that.
+	await step();
+	const moved = await registersIn('Scalar Registers');
+	assert.equal(moved.get('x0')!.value,
+		'0x00002010 (8208) [was 0x2000] [mapped to: xGm]');
+	// A register that never moved carries no marker at all.
+	assert.equal(/\[was /.test(moved.get('x1')!.value), false);
+
+	// The stop after: x0 holds. The string has to be byte-identical, or VS
+	// Code diffs it against the last one and highlights a register that did
+	// not move - which is the whole reason the marker pins the last
+	// *different* value instead of the previous stop's.
+	await step();
+	const held = await registersIn('Scalar Registers');
+	assert.equal(held.get('x0')!.value, moved.get('x0')!.value);
+
+	// And re-reading within one stop stays put too.
+	const again = await registersIn('Scalar Registers');
+	assert.equal(again.get('x0')!.value, held.get('x0')!.value);
+});
+
+/** Step one line and wait for the stop that follows. */
+async function step(): Promise<void> {
+	const stopped = client.waitForNextEvent('stopped');
+	const response = await client.send<DebugProtocol.NextResponse>('next', { threadId: 1 });
+	assert.ok(response.success, `next failed: ${response.message}`);
+	await stopped;
+}
 
 /** The Registers scope's folder rows. */
 async function registerFolders(): Promise<DebugProtocol.Variable[]> {
