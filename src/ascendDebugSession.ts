@@ -39,6 +39,8 @@ import {
 	ExecutionMode,
 	AscendLaunchArguments,
 	DEFAULT_SETUP_COMMANDS,
+	MI_TRACE_EVENT,
+	MiTraceEventBody,
 	NpuMemoryRegion,
 	resolveExecutionMode,
 	SetupCommand,
@@ -449,19 +451,23 @@ export class AscendDebugSession extends LoggingDebugSession {
 	}
 
 	/**
-	 * Diagnostics, as opposed to output: always to the adapter's log file, and
-	 * to the Debug Console only when the user asked for tracing.
+	 * Every line of the MI dialogue: the commands the adapter sends, GDB's
+	 * replies, and GDB's own `~` console and `&` log streams.
 	 *
-	 * This is where GDB's own chatter goes - the `~` console stream and the
-	 * `&` log stream. The `&` stream is GDB echoing back every command the
-	 * adapter sends it, and the adapter sends a lot of them: a varobj per
-	 * visible variable on every stop. Forwarding that to the Debug Console is
-	 * what buries the kernel's printf output, and it is also what made every
-	 * REPL command print its answer twice - once as the evaluate result and
-	 * once as the echoed stream.
+	 * None of it is hidden - it is *moved*. It goes out as a custom DAP event
+	 * that the extension host appends to the "Ascend GDB Trace" output
+	 * channel, so the whole dialogue stays there for the next time the adapter
+	 * itself misbehaves, while the Debug Console keeps carrying the debuggee's
+	 * output and nothing else.
+	 *
+	 * That distinction matters most for the `&` stream, which is GDB echoing
+	 * back every command we send it - and we send a lot of them, a varobj per
+	 * visible variable on every stop.
 	 */
 	private trace(text: string): void {
 		logger.verbose(text.replace(/\n+$/, ''));
+		this.sendEvent(new Event(MI_TRACE_EVENT, { log: text } as MiTraceEventBody));
+		// Opt-in: MI interleaved with the debuggee's own output, in order.
 		if (this.traceMi) {
 			this.sendEvent(new OutputEvent(text, 'console'));
 		}

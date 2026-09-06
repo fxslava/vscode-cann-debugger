@@ -73,6 +73,18 @@ export class DapClient {
 			.join('');
 	}
 
+	/** Bodies of a custom event, in arrival order. */
+	public custom(event: string): unknown[] {
+		return this.events.filter((e) => e.event === event).map((e) => e.body);
+	}
+
+	/** The MI dialogue the adapter has published, concatenated. */
+	public traceLog(): string {
+		return this.custom('ascend.miTrace')
+			.map((body) => (body as { log?: string }).log ?? '')
+			.join('');
+	}
+
 	private onData(chunk: Buffer): void {
 		this.buffer = Buffer.concat([this.buffer, chunk]);
 		for (;;) {

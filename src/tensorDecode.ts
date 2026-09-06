@@ -52,6 +52,31 @@ export const DTYPES: readonly DTypeInfo[] = [
 /** A tensor bigger than this is a memory dump, not something to read in a grid. */
 export const MAX_ELEMENTS = 65536;
 
+/**
+ * The pseudo-type that means "the user's own decoder". There is no stride to
+ * derive a byte count from, so a script window is sized in bytes directly.
+ */
+export const SCRIPT_DTYPE = 'script';
+
+/** Ceiling on a script window: it crosses to the webview as base64. */
+export const MAX_SCRIPT_BYTES = 1024 * 1024;
+
+/**
+ * Parse a byte count as typed - decimal or `0x` hex. Returns undefined for
+ * anything that is not a usable window, so the caller can say which.
+ */
+export function parseByteCount(text: string): number | undefined {
+	const trimmed = (text || '').trim();
+	if (!/^(0[xX][0-9a-fA-F]+|\d+)$/.test(trimmed)) {
+		return undefined;
+	}
+	const value = Number(trimmed);
+	if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_SCRIPT_BYTES) {
+		return undefined;
+	}
+	return value;
+}
+
 export function dtypeInfo(dtype: TensorDType): DTypeInfo {
 	const found = DTYPES.find((d) => d.id === dtype);
 	if (!found) {

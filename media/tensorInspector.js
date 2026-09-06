@@ -23,10 +23,27 @@
 		message: /** @type {HTMLElement} */ (document.getElementById('message')),
 		stats: /** @type {HTMLElement} */ (document.getElementById('stats')),
 		grid: /** @type {HTMLElement} */ (document.getElementById('grid')),
+		scriptPanel: /** @type {HTMLElement} */ (document.getElementById('scriptPanel')),
+		script: /** @type {HTMLTextAreaElement} */ (document.getElementById('script')),
+		bytes: /** @type {HTMLInputElement} */ (document.getElementById('bytes')),
 	};
+
+	const SCRIPT_DTYPE = 'script';
 
 	/** The last payload, so toggling the heat map does not re-read memory. */
 	let last = null;
+	/** The last raw window, so editing the script does not re-read memory. */
+	let lastRaw = null;
+
+	el.script.value = TensorScript.TEMPLATE;
+
+	function scriptMode() {
+		return el.dtype.value === SCRIPT_DTYPE;
+	}
+
+	function syncMode() {
+		el.scriptPanel.hidden = !scriptMode();
+	}
 
 	function requestRead() {
 		showMessage('');
@@ -36,13 +53,33 @@
 			dtype: el.dtype.value,
 			shape: el.shape.value,
 			offset: el.offset.value,
+			bytes: el.bytes.value,
 		});
 	}
 
 	el.read.addEventListener('click', requestRead);
+	el.dtype.addEventListener('change', syncMode);
 	el.heatmap.addEventListener('change', function () {
 		if (last) {
 			renderGrid(last);
+		}
+	});
+
+	// Re-running the script is free - the bytes are already here - so an edit
+	// re-renders without another trip to the target.
+	el.script.addEventListener('keydown', function (event) {
+		if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+			event.preventDefault();
+			if (lastRaw) {
+				applyScript(lastRaw);
+			} else {
+				requestRead();
+			}
+		}
+	});
+	el.bytes.addEventListener('keydown', function (event) {
+		if (event.key === 'Enter') {
+			requestRead();
 		}
 	});
 
@@ -61,10 +98,15 @@
 				applySeed(message);
 				break;
 			case 'data':
+				lastRaw = null;
 				last = message;
 				showMessage(message.note || '', 'info');
 				renderStats(message);
 				renderGrid(message);
+				break;
+			case 'raw':
+				lastRaw = message;
+				applyScript(message);
 				break;
 			case 'error':
 				showMessage(message.message || 'Read failed.');
@@ -82,6 +124,61 @@
 		}
 	});
 
+	/**
+	 * Hand the raw window to the user's decoder and render whatever comes back.
+	 *
+	 * A bad script is an ordinary outcome here, not a crash: the message goes
+	 * into the banner with the grid left as it was, so the previous good
+	 * result stays on screen while the script is being fixed.
+	 */
+	function applyScript(raw) {
+		const buffer = TensorScript.decodeBase64(raw.data);
+		const result = TensorScript.runScript(el.script.value, buffer, raw.shape || []);
+
+		if (result.error) {
+			showMessage(result.error);
+			return;
+		}
+		if (!result.text.length) {
+			showMessage('Script returned no rows.', 'info');
+			el.grid.innerHTML = '<p class="hint">Nothing to show.</p>';
+			el.stats.hidden = true;
+			return;
+		}
+
+		const columns = result.text.reduce(function (widest, row) {
+			return Math.max(widest, row.length);
+		}, 0);
+
+		// Flatten to the same payload shape the built-in decoders produce, so
+		// there is one renderer rather than two.
+		const flatText = [];
+		const flatValues = [];
+		for (let r = 0; r < result.text.length; r++) {
+			for (let c = 0; c < columns; c++) {
+				const has = c < result.text[r].length;
+				flatText.push(has ? result.text[r][c] : undefined);
+				flatValues.push(has ? result.values[r][c] : null);
+			}
+		}
+
+		const payload = {
+			address: raw.address,
+			dtype: 'script',
+			shape: raw.shape,
+			rows: result.text.length,
+			columns: columns,
+			text: flatText,
+			values: flatValues,
+			stats: TensorScript.statsFromCells(result.values),
+		};
+
+		last = payload;
+		showMessage(raw.note || '', 'info');
+		renderStats(payload);
+		renderGrid(payload);
+	}
+
 	function applySeed(seed) {
 		if (seed.address) {
 			el.address.value = seed.address;
@@ -92,6 +189,7 @@
 		if (seed.shape) {
 			el.shape.value = seed.shape;
 		}
+		syncMode();
 		// A seeded address means the user picked a specific buffer: read it
 		// straight away rather than making them press the button again.
 		if (seed.address) {
@@ -110,6 +208,7 @@
 		const parts = [
 			span('address', data.address),
 			span('shape', (data.shape || []).join(' x ') + ' ' + data.dtype),
+			span('grid', data.rows + ' x ' + data.columns),
 			span('min', format(stats.min)),
 			span('max', format(stats.max)),
 			span('mean', format(stats.mean)),

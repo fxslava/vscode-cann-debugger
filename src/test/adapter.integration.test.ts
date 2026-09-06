@@ -402,6 +402,28 @@ test('the Debug Console carries the kernel output and nothing else', async () =>
 	assert.equal(consoleText.includes('AddCustom: tile 0 of 8'), false);
 });
 
+test('the MI dialogue is published for the trace channel, not discarded', async () => {
+	// Nothing is hidden - it is moved. The extension host appends these to the
+	// "Ascend GDB Trace" output channel.
+	const trace = client.traceLog();
+
+	// Commands we sent, with the MI token the reply carries.
+	assert.match(trace, /--> \d+-exec-run/);
+	assert.match(trace, /--> \d+-break-insert/);
+	// GDB's replies.
+	assert.match(trace, /<-- \d+\^done/);
+	// The & log stream, which is the thing that used to flood the console.
+	assert.match(trace, /-stack-list-variables --thread 1/);
+	// The ~ console stream.
+	assert.match(trace, /New Thread 0x7ffd/);
+
+	// The trace is a faithful transcript of the wire, so the debuggee's output
+	// appears here too - but in its raw `@"..."` record form. What matters is
+	// that the decoded text reaches the console as well, which is asserted
+	// above; the trace is a copy, not a diversion.
+	assert.match(trace, /<-- @"AddCustom: tile 0 of 8/);
+});
+
 test('a REPL command answers once, not twice', async () => {
 	// The ~ stream carrying the answer is captured to become the result; if it
 	// were also forwarded as output, every command would print twice.

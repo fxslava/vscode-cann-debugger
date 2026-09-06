@@ -63,12 +63,12 @@ export interface AscendCommonArguments {
 	memoryReferences?: 'auto' | 'all' | 'off';
 
 	/**
-	 * Mirror the GDB/MI dialogue - the commands the adapter sends, GDB's
-	 * replies, and GDB's own `~`/`&` chatter - into the Debug Console.
+	 * Additionally mirror the GDB/MI dialogue into the Debug Console.
 	 *
-	 * Off by default, so the console carries the debuggee's output and nothing
-	 * else. The traffic is still written to the adapter's log file either way,
-	 * so a session can be diagnosed after the fact without re-running it.
+	 * Rarely needed: the dialogue always goes to the "Ascend GDB Trace" output
+	 * channel and to the adapter's log file, so nothing is lost with this off.
+	 * It exists for the case where seeing MI interleaved with the debuggee's
+	 * own output, in one place and in order, is the thing that explains a bug.
 	 */
 	trace?: boolean;
 
@@ -79,6 +79,24 @@ export interface AscendCommonArguments {
 		/** DAP-level tracing from the base adapter: every protocol message. */
 		trace?: boolean;
 	};
+}
+
+/* -------------------------------------------------------------------------
+ * Custom DAP events: the contract between the adapter process and the
+ * extension host. Both sides import these names rather than spelling the
+ * string twice.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * One line of GDB/MI dialogue, in either direction, or a `~`/`&` stream record.
+ * The extension host appends the payload to the "Ascend GDB Trace" output
+ * channel: the traffic stays available without it ever reaching the Debug
+ * Console, where it would bury the debuggee's own output.
+ */
+export const MI_TRACE_EVENT = 'ascend.miTrace';
+
+export interface MiTraceEventBody {
+	log: string;
 }
 
 /**

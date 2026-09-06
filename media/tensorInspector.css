@@ -49,6 +49,37 @@ body {
 	font-size: 0.9em;
 }
 
+textarea {
+	box-sizing: border-box;
+	width: 100%;
+	margin-bottom: 10px;
+	padding: 6px 8px;
+	resize: vertical;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 2px;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: var(--vscode-editor-font-size, 12px);
+	line-height: 1.45;
+	tab-size: 2;
+}
+
+textarea:focus {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.hint code {
+	font-family: var(--vscode-editor-font-family, monospace);
+	color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+}
+
+.hint.grow {
+	flex: 1 1 260px;
+	margin: 0 0 4px;
+}
+
 input[type='text'],
 select {
 	box-sizing: border-box;

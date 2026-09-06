@@ -8,7 +8,12 @@
 
 import { execFile } from 'child_process';
 import * as vscode from 'vscode';
-import { AscendLaunchArguments, NpuMemoryRegion } from './configuration';
+import {
+	AscendLaunchArguments,
+	MI_TRACE_EVENT,
+	MiTraceEventBody,
+	NpuMemoryRegion,
+} from './configuration';
 import { DEFAULT_PASSWORD_ENV_VAR } from './sshLauncher';
 import { readPassword } from './targetManager/targetConfig';
 import { TargetViewProvider } from './targetManager/targetViewProvider';
@@ -43,7 +48,27 @@ export function activate(context: vscode.ExtensionContext): void {
 		// carries the clicked variable, and from the palette, where it does not.
 		vscode.commands.registerCommand('ascend-gdb.inspectTensor', (arg?: unknown) =>
 			TensorInspectorPanel.show(context, seedFromContext(arg))),
+		vscode.debug.onDidReceiveDebugSessionCustomEvent(onCustomDebugEvent),
 	);
+}
+
+/**
+ * The adapter's own diagnostics, kept out of the Debug Console.
+ *
+ * Every line of GDB/MI dialogue arrives here as a custom event and goes to a
+ * dedicated output channel, so the console stays reserved for the debuggee's
+ * stdout while the raw traffic remains one click away in the Output tab.
+ */
+function onCustomDebugEvent(event: vscode.DebugSessionCustomEvent): void {
+	if (event.session.type !== DEBUG_TYPE || event.event !== MI_TRACE_EVENT) {
+		return;
+	}
+	const body = event.body as MiTraceEventBody | undefined;
+	if (typeof body?.log === 'string') {
+		// append, not appendLine: the adapter's text already carries newlines
+		// exactly as GDB produced them.
+		getTraceChannel().append(body.log);
+	}
 }
 
 /**
@@ -92,7 +117,12 @@ class AscendAdapterDescriptorFactory implements vscode.DebugAdapterDescriptorFac
 }
 
 export function deactivate(): void {
-	/* nothing to clean up: the adapter process exits with the session */
+	// The adapter process exits with the session; only the channels we made
+	// lazily, outside the subscription list, need letting go of.
+	outputChannel?.dispose();
+	outputChannel = undefined;
+	traceChannel?.dispose();
+	traceChannel = undefined;
 }
 
 class AscendConfigurationProvider implements vscode.DebugConfigurationProvider {
@@ -261,6 +291,17 @@ let outputChannel: vscode.OutputChannel | undefined;
 function getOutputChannel(): vscode.OutputChannel {
 	outputChannel ??= vscode.window.createOutputChannel('Ascend GDB');
 	return outputChannel;
+}
+
+/**
+ * Created on the first trace line rather than at activation, so a user who
+ * never debugs is not given an empty channel to scroll past in the Output
+ * dropdown.
+ */
+let traceChannel: vscode.OutputChannel | undefined;
+function getTraceChannel(): vscode.OutputChannel {
+	traceChannel ??= vscode.window.createOutputChannel('Ascend GDB Trace');
+	return traceChannel;
 }
 
 function listWslDistros(): Promise<string[]> {

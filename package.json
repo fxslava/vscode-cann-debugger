@@ -513,7 +513,7 @@
               },
               "trace": {
                 "type": "boolean",
-                "description": "Mirror the GDB/MI dialogue - commands, replies, and GDB's own chatter - into the Debug Console. Off by default so the console carries only the debuggee's output; the traffic is written to the adapter log file either way.",
+                "description": "Additionally mirror the GDB/MI dialogue into the Debug Console. Rarely needed: the dialogue always goes to the \"Ascend GDB Trace\" output channel and to the adapter log file, so nothing is lost with this off.",
                 "default": false
               },
               "logging": {
@@ -795,7 +795,7 @@
               },
               "trace": {
                 "type": "boolean",
-                "description": "Mirror the GDB/MI dialogue into the Debug Console. Off by default; the traffic is written to the adapter log file either way.",
+                "description": "Additionally mirror the GDB/MI dialogue into the Debug Console. The dialogue always goes to the \"Ascend GDB Trace\" output channel regardless.",
                 "default": false
               },
               "logging": {

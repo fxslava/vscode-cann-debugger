@@ -24,7 +24,10 @@ import {
 	guessDType,
 	isTensorDType,
 	MAX_ELEMENTS,
+	MAX_SCRIPT_BYTES,
+	parseByteCount,
 	parseShape,
+	SCRIPT_DTYPE,
 	shapeElements,
 	TensorDType,
 	tensorStats,
@@ -40,12 +43,22 @@ export interface TensorSeed {
 	label?: string;
 }
 
+/**
+ * How the bytes are to be turned into cells: by one of the built-in decoders,
+ * or by the user's own script in the webview. The two differ in who sizes the
+ * window - a dtype implies a stride, a script does not - and in what crosses
+ * back, decoded values or raw bytes.
+ */
+type TensorMode =
+	| { kind: 'decode'; dtype: TensorDType }
+	| { kind: 'script'; bytes: number };
+
 /** One fully-specified read. */
 interface TensorRequest {
 	address: string;
-	dtype: TensorDType;
 	shape: number[];
 	offset: number;
+	mode: TensorMode;
 }
 
 export class TensorInspectorPanel {
@@ -152,9 +165,10 @@ export class TensorInspectorPanel {
 			return;
 		}
 
-		const { size } = dtypeInfo(request.dtype);
 		const elements = shapeElements(request.shape);
-		const count = elements * size;
+		const count = request.mode.kind === 'script'
+			? request.mode.bytes
+			: elements * dtypeInfo(request.mode.dtype).size;
 
 		this.post({ type: 'busy', busy: true });
 		try {
@@ -165,23 +179,43 @@ export class TensorInspectorPanel {
 			}) as { address?: string; data?: string; unreadableBytes?: number } | undefined;
 
 			const bytes = Buffer.from(response?.data ?? '', 'base64');
-			const values = decodeTensor(bytes, request.dtype, elements);
+			const address = response?.address ?? request.address;
+			const unreadable = response?.unreadableBytes ?? 0;
+
+			if (request.mode.kind === 'script') {
+				// The window goes over untouched: the script is the decoder,
+				// so this side has no business deciding what the bytes mean.
+				this.post({
+					type: 'raw',
+					address,
+					shape: request.shape,
+					data: bytes.toString('base64'),
+					byteLength: bytes.length,
+					note: bytes.length < count
+						? `${(count - bytes.length).toLocaleString()} of ${count.toLocaleString()} bytes were not readable.`
+						: undefined,
+				});
+				return;
+			}
+
+			const dtype = request.mode.dtype;
+			const values = decodeTensor(bytes, dtype, elements);
 			const { rows, columns } = gridShape(request.shape);
 
 			this.post({
 				type: 'data',
-				address: response?.address ?? request.address,
-				dtype: request.dtype,
+				address,
+				dtype,
 				shape: request.shape,
 				rows,
 				columns,
-				text: values.map((value) => formatValue(value, request.dtype)),
+				text: values.map((value) => formatValue(value, dtype)),
 				// JSON has no NaN or Infinity: they would arrive as null anyway,
 				// so send null deliberately and let the colour scale skip them.
 				// `text` still carries the real value for display.
 				values: values.map((value) => (Number.isFinite(value) ? value : null)),
 				stats: tensorStats(values),
-				note: this.describeShortfall(values.length, elements, response?.unreadableBytes ?? 0),
+				note: this.describeShortfall(values.length, elements, unreadable),
 			});
 		} catch (err) {
 			this.post({ type: 'error', message: (err as Error).message });
@@ -194,11 +228,6 @@ export class TensorInspectorPanel {
 		const address = String(body['address'] ?? '').trim();
 		if (!address) {
 			return 'Enter an address, or an expression that evaluates to one.';
-		}
-
-		const dtype = body['dtype'];
-		if (!isTensorDType(dtype)) {
-			return `Unknown data type: ${String(dtype)}.`;
 		}
 
 		const shape = parseShape(String(body['shape'] ?? ''));
@@ -218,7 +247,20 @@ export class TensorInspectorPanel {
 			return `Offset must be a whole number of bytes: ${offsetText}`;
 		}
 
-		return { address, dtype, shape, offset };
+		const dtype = body['dtype'];
+		if (dtype === SCRIPT_DTYPE) {
+			// No stride to multiply out, so the window is sized in bytes.
+			const bytes = parseByteCount(String(body['bytes'] ?? ''));
+			if (bytes === undefined) {
+				return `Bytes must be a whole number from 1 to ${MAX_SCRIPT_BYTES.toLocaleString()}.`;
+			}
+			return { address, shape, offset, mode: { kind: 'script', bytes } };
+		}
+		if (!isTensorDType(dtype)) {
+			return `Unknown data type: ${String(dtype)}.`;
+		}
+
+		return { address, shape, offset, mode: { kind: 'decode', dtype } };
 	}
 
 	/** Say plainly when the window was only partly readable. */
@@ -242,6 +284,7 @@ export class TensorInspectorPanel {
 
 		const options = DTYPES
 			.map((d) => `<option value="${d.id}">${d.label}</option>`)
+			.concat(`<option value="${SCRIPT_DTYPE}">Custom script...</option>`)
 			.join('\n\t\t\t');
 
 		return `<!DOCTYPE html>
@@ -249,7 +292,7 @@ export class TensorInspectorPanel {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}' 'unsafe-eval';">
 <link rel="stylesheet" href="${asset('tensorInspector.css')}">
 <title>Tensor Inspector</title>
 </head>
@@ -279,6 +322,21 @@ export class TensorInspectorPanel {
 		</div>
 	</div>
 
+	<div id="scriptPanel" hidden>
+		<div class="toolbar">
+			<div class="field narrow">
+				<label for="bytes">Bytes</label>
+				<input type="text" id="bytes" spellcheck="false" autocomplete="off" value="1024">
+			</div>
+			<p class="hint grow">
+				Body of a function of <code>(buffer, shape)</code>. <code>buffer</code> is a
+				<code>Uint8Array</code> of the window above; return a 2-D array of numbers or
+				strings, one array per row. A flat array counts as a single row.
+			</p>
+		</div>
+		<textarea id="script" spellcheck="false" rows="14"></textarea>
+	</div>
+
 	<div class="field checkbox">
 		<input type="checkbox" id="heatmap" checked>
 		<label for="heatmap">Colour by magnitude</label>
@@ -290,6 +348,7 @@ export class TensorInspectorPanel {
 		<p class="hint">Stop at a breakpoint, point this at a buffer, and press Read.</p>
 	</div>
 
+	<script nonce="${nonce}" src="${asset('tensorScript.js')}"></script>
 	<script nonce="${nonce}" src="${asset('tensorInspector.js')}"></script>
 </body>
 </html>`;

@@ -18,7 +18,10 @@ import {
 	gridShape,
 	guessDType,
 	isTensorDType,
+	MAX_SCRIPT_BYTES,
+	parseByteCount,
 	parseShape,
+	SCRIPT_DTYPE,
 	readBFloat16,
 	readFloat16,
 	shapeElements,
@@ -157,6 +160,34 @@ test('flattens a shape into rows and columns, last dimension across', () => {
 	assert.deepEqual(gridShape([256]), { rows: 1, columns: 256 });
 	assert.deepEqual(gridShape([]), { rows: 0, columns: 0 });
 	assert.equal(shapeElements([2, 3, 4]), 24);
+});
+
+/* -------------------------------------------------------------------------
+ * Script windows
+ * ---------------------------------------------------------------------- */
+
+test('sizes a custom-script window in bytes, decimal or hex', () => {
+	// A script has no stride to multiply out, so it says how much to read.
+	assert.equal(parseByteCount('1024'), 1024);
+	assert.equal(parseByteCount(' 0x400 '), 1024);
+	assert.equal(parseByteCount('1'), 1);
+	assert.equal(parseByteCount(String(MAX_SCRIPT_BYTES)), MAX_SCRIPT_BYTES);
+});
+
+test('refuses a window that is empty, negative or larger than the channel', () => {
+	assert.equal(parseByteCount(''), undefined);
+	assert.equal(parseByteCount('0'), undefined);
+	assert.equal(parseByteCount('-16'), undefined);
+	assert.equal(parseByteCount('16.5'), undefined);
+	assert.equal(parseByteCount('lots'), undefined);
+	// It crosses to the webview as base64; there is a ceiling.
+	assert.equal(parseByteCount(String(MAX_SCRIPT_BYTES + 1)), undefined);
+});
+
+test('the script pseudo-type is not one of the built-in decoders', () => {
+	// parseRequest branches on it before the dtype check, so it must not also
+	// answer to isTensorDType.
+	assert.equal(isTensorDType(SCRIPT_DTYPE), false);
 });
 
 /* -------------------------------------------------------------------------
