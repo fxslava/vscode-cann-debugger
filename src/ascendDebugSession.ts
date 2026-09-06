@@ -49,6 +49,14 @@ import {
 import { MiConnection, MiError, quoteMiString } from './mi/miConnection';
 import { miArray, miList, miNumber, miString, miTuple, MiRecord } from './mi/miParser';
 import { PathMapper } from './pathMapper';
+import {
+	annotateRegisterValue,
+	categorizeRegister,
+	groupRegisters,
+	parseRegisterBinding,
+	RegisterGroup,
+	REGISTER_GROUPS,
+} from './registers';
 import { buildDebuggerSpawn, buildSignalEnv, buildSignalPrefix } from './wslLauncher';
 import {
 	classifyType,
@@ -71,6 +79,13 @@ import {
 interface FrameRef {
 	threadId: number;
 	level: number;
+}
+
+/** One folder of the Registers scope: vector, scalar or system. */
+interface RegisterGroupContainer {
+	kind: 'registerGroup';
+	group: RegisterGroup;
+	frame: FrameRef;
 }
 
 /** Children come straight from GDB's own varobj tree. */
@@ -111,6 +126,7 @@ type VariableContainer =
 	| { kind: 'locals'; frame: FrameRef }
 	| { kind: 'arguments'; frame: FrameRef }
 	| { kind: 'registers'; frame: FrameRef }
+	| RegisterGroupContainer
 	| { kind: 'npu' }
 	| VarobjContainer
 	| FormattedContainer
@@ -159,6 +175,8 @@ export class AscendDebugSession extends LoggingDebugSession {
 	private dataBreakpointIds: number[] = [];
 
 	private registerNames?: string[];
+	/** Locals held in registers, rebuilt on each stop; see readRegisterBindings. */
+	private registerBindings?: Map<string, string[]>;
 	/** Cached probe result: lldb-mi lacks -data-write-memory-bytes. */
 	private supportsWriteMemoryBytes?: boolean;
 	private stoppedThreadId = 1;
@@ -557,6 +575,9 @@ export class AscendDebugSession extends LoggingDebugSession {
 	}
 
 	private resetHandles(): void {
+		// Bindings are a property of one stop: the next one may hold entirely
+		// different locals in entirely different registers.
+		this.registerBindings = undefined;
 		this.variableHandles.reset();
 		this.frameHandles.reset();
 		this.renderedVariables.clear();
@@ -1004,6 +1025,9 @@ export class AscendDebugSession extends LoggingDebugSession {
 				case 'registers':
 					variables = await this.readRegisters(container.frame);
 					break;
+				case 'registerGroup':
+					variables = await this.readRegisterGroup(container);
+					break;
 				case 'npu':
 					variables = await this.readNpuRegions();
 					break;
@@ -1350,26 +1374,52 @@ export class AscendDebugSession extends LoggingDebugSession {
 		return resolveMemoryAddress(this.mi, pathExpr, shape, frame.threadId, frame.level);
 	}
 
+	/**
+	 * The Registers scope itself: one folder per group, not a wall of a
+	 * hundred rows. Empty groups are left out rather than shown empty.
+	 */
 	private async readRegisters(frame: FrameRef): Promise<DebugProtocol.Variable[]> {
-		if (!this.registerNames) {
-			const namesRecord = await this.mi.sendCommand('-data-list-register-names');
-			this.registerNames = miArray(namesRecord.results['register-names'])
-				.map((v) => (typeof v === 'string' ? v : ''));
+		const groups = groupRegisters(await this.readRegisterNames());
+
+		const out: DebugProtocol.Variable[] = [];
+		for (const info of REGISTER_GROUPS) {
+			const members = groups.get(info.id) ?? [];
+			if (!members.length) {
+				continue;
+			}
+			out.push({
+				name: info.label,
+				value: `${members.length} registers`,
+				variablesReference: this.variableHandles.create(
+					{ kind: 'registerGroup', group: info.id, frame }),
+				namedVariables: members.length,
+				presentationHint: { kind: 'data' },
+			});
 		}
+		return out;
+	}
+
+	/** The registers in one folder, with their values and any locals held in them. */
+	private async readRegisterGroup(
+		container: RegisterGroupContainer,
+	): Promise<DebugProtocol.Variable[]> {
+		const frame = container.frame;
+		const names = await this.readRegisterNames();
 		const record = await this.mi.sendCommand(
 			`-data-list-register-values --thread ${frame.threadId} --frame ${frame.level} x`);
+		const bindings = await this.readRegisterBindings(frame);
 
 		const out: DebugProtocol.Variable[] = [];
 		for (const entry of miList(record.results['register-values'], 'register-values')) {
 			const number = miNumber(entry['number'], -1);
-			const name = (number >= 0 && this.registerNames[number]) || `r${number}`;
-			if (!name) {
+			const name = (number >= 0 && names[number]) || `r${number}`;
+			if (!name || categorizeRegister(name) !== container.group) {
 				continue;
 			}
 			const value = miString(entry['value']);
 			const variable: DebugProtocol.Variable = {
 				name,
-				value,
+				value: annotateRegisterValue(value, bindings.get(name) ?? []),
 				variablesReference: 0,
 				evaluateName: `$${name}`,
 				presentationHint: { kind: 'data', attributes: ['readOnly'] },
@@ -1382,6 +1432,65 @@ export class AscendDebugSession extends LoggingDebugSession {
 			out.push(variable);
 		}
 		return out;
+	}
+
+	private async readRegisterNames(): Promise<string[]> {
+		if (!this.registerNames) {
+			const record = await this.mi.sendCommand('-data-list-register-names');
+			this.registerNames = miArray(record.results['register-names'])
+				.map((v) => (typeof v === 'string' ? v : ''));
+		}
+		return this.registerNames;
+	}
+
+	/**
+	 * Which locals are living in which registers, for this stop.
+	 *
+	 * There is no MI command for this, so it goes through `info address` per
+	 * variable and parses the answer. That is one round trip each, hence the
+	 * cache; and the first refusal disables the whole thing for the stop,
+	 * because a debugger that does not implement `info address` will not
+	 * implement it any better on the ninth variable than on the first.
+	 *
+	 * A debugger that cannot answer costs one wasted command and no
+	 * annotations - never an error the user has to read.
+	 */
+	private async readRegisterBindings(frame: FrameRef): Promise<Map<string, string[]>> {
+		if (this.registerBindings) {
+			return this.registerBindings;
+		}
+		const bindings = new Map<string, string[]>();
+		this.registerBindings = bindings;
+
+		let locals: string[];
+		try {
+			const record = await this.mi.sendCommand(
+				`-stack-list-variables --thread ${frame.threadId} --frame ${frame.level} --no-values`);
+			locals = miArray(record.results['variables'])
+				.map((entry) => miString(miTuple(entry)?.['name'] ?? ''))
+				.filter(Boolean);
+		} catch {
+			return bindings;
+		}
+
+		for (const local of locals) {
+			let answer: string;
+			try {
+				answer = await this.mi.sendCliCommand(`info address ${local}`);
+			} catch {
+				// Not supported by this debugger; stop asking.
+				logger.verbose(`info address unavailable; register mapping disabled`);
+				return bindings;
+			}
+			const binding = parseRegisterBinding(answer);
+			if (!binding) {
+				continue;
+			}
+			const held = bindings.get(binding.register) ?? [];
+			held.push(binding.symbol);
+			bindings.set(binding.register, held);
+		}
+		return bindings;
 	}
 
 	/** The synthetic "NPU Memory" scope: named windows into on-chip buffers. */

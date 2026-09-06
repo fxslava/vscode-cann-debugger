@@ -23,12 +23,16 @@
 		message: /** @type {HTMLElement} */ (document.getElementById('message')),
 		stats: /** @type {HTMLElement} */ (document.getElementById('stats')),
 		grid: /** @type {HTMLElement} */ (document.getElementById('grid')),
-		scriptPanel: /** @type {HTMLElement} */ (document.getElementById('scriptPanel')),
+		customPanel: /** @type {HTMLElement} */ (document.getElementById('customPanel')),
 		script: /** @type {HTMLTextAreaElement} */ (document.getElementById('script')),
+		struct: /** @type {HTMLTextAreaElement} */ (document.getElementById('struct')),
+		scriptHint: /** @type {HTMLElement} */ (document.getElementById('scriptHint')),
+		structHint: /** @type {HTMLElement} */ (document.getElementById('structHint')),
 		bytes: /** @type {HTMLInputElement} */ (document.getElementById('bytes')),
 	};
 
 	const SCRIPT_DTYPE = 'script';
+	const STRUCT_DTYPE = 'struct';
 
 	/** The last payload, so toggling the heat map does not re-read memory. */
 	let last = null;
@@ -36,13 +40,25 @@
 	let lastRaw = null;
 
 	el.script.value = TensorScript.TEMPLATE;
+	el.struct.value = TensorStruct.TEMPLATE;
 
-	function scriptMode() {
-		return el.dtype.value === SCRIPT_DTYPE;
+	function mode() {
+		return el.dtype.value;
 	}
 
+	function customMode() {
+		return mode() === SCRIPT_DTYPE || mode() === STRUCT_DTYPE;
+	}
+
+	/** Show the editor and hint belonging to the selected mode, if any. */
 	function syncMode() {
-		el.scriptPanel.hidden = !scriptMode();
+		const script = mode() === SCRIPT_DTYPE;
+		const struct = mode() === STRUCT_DTYPE;
+		el.customPanel.hidden = !customMode();
+		el.script.hidden = !script;
+		el.scriptHint.hidden = !script;
+		el.struct.hidden = !struct;
+		el.structHint.hidden = !struct;
 	}
 
 	function requestRead() {
@@ -67,15 +83,17 @@
 
 	// Re-running the script is free - the bytes are already here - so an edit
 	// re-renders without another trip to the target.
-	el.script.addEventListener('keydown', function (event) {
-		if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-			event.preventDefault();
-			if (lastRaw) {
-				applyScript(lastRaw);
-			} else {
-				requestRead();
+	[el.script, el.struct].forEach(function (editor) {
+		editor.addEventListener('keydown', function (event) {
+			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+				event.preventDefault();
+				if (lastRaw) {
+					applyCustom(lastRaw);
+				} else {
+					requestRead();
+				}
 			}
-		}
+		});
 	});
 	el.bytes.addEventListener('keydown', function (event) {
 		if (event.key === 'Enter') {
@@ -106,7 +124,7 @@
 				break;
 			case 'raw':
 				lastRaw = message;
-				applyScript(message);
+				applyCustom(message);
 				break;
 			case 'error':
 				showMessage(message.message || 'Read failed.');
@@ -125,33 +143,41 @@
 	});
 
 	/**
-	 * Hand the raw window to the user's decoder and render whatever comes back.
+	 * Hand the raw window to the user's decoder - a snippet or a struct - and
+	 * render whatever comes back.
 	 *
-	 * A bad script is an ordinary outcome here, not a crash: the message goes
+	 * A bad decoder is an ordinary outcome here, not a crash: the message goes
 	 * into the banner with the grid left as it was, so the previous good
-	 * result stays on screen while the script is being fixed.
+	 * result stays on screen while it is being fixed.
 	 */
-	function applyScript(raw) {
+	function applyCustom(raw) {
 		const buffer = TensorScript.decodeBase64(raw.data);
-		const result = TensorScript.runScript(el.script.value, buffer, raw.shape || []);
+		const struct = mode() === STRUCT_DTYPE;
+		const result = struct
+			? TensorStruct.decodeStructs(el.struct.value, buffer)
+			: TensorScript.runScript(el.script.value, buffer, raw.shape || []);
 
 		if (result.error) {
 			showMessage(result.error);
 			return;
 		}
 		if (!result.text.length) {
-			showMessage('Script returned no rows.', 'info');
+			showMessage('Nothing decoded from this window.', 'info');
 			el.grid.innerHTML = '<p class="hint">Nothing to show.</p>';
 			el.stats.hidden = true;
 			return;
 		}
 
-		const columns = result.text.reduce(function (widest, row) {
-			return Math.max(widest, row.length);
-		}, 0);
+		// A struct names its columns; a script only has however many cells the
+		// widest row returned.
+		const columns = result.columns
+			? result.columns.length
+			: result.text.reduce(function (widest, row) {
+				return Math.max(widest, row.length);
+			}, 0);
 
 		// Flatten to the same payload shape the built-in decoders produce, so
-		// there is one renderer rather than two.
+		// there is one renderer rather than three.
 		const flatText = [];
 		const flatValues = [];
 		for (let r = 0; r < result.text.length; r++) {
@@ -162,19 +188,29 @@
 			}
 		}
 
+		const notes = [];
+		if (struct) {
+			notes.push(result.count + ' x ' + result.name + ', ' + result.size + ' bytes each' +
+				(result.packed ? ' (packed)' : ''));
+		}
+		if (raw.note) {
+			notes.push(raw.note);
+		}
+
 		const payload = {
 			address: raw.address,
-			dtype: 'script',
+			dtype: mode(),
 			shape: raw.shape,
 			rows: result.text.length,
 			columns: columns,
+			headers: result.columns,
 			text: flatText,
 			values: flatValues,
 			stats: TensorScript.statsFromCells(result.values),
 		};
 
 		last = payload;
-		showMessage(raw.note || '', 'info');
+		showMessage(notes.join(' - '), 'info');
 		renderStats(payload);
 		renderGrid(payload);
 	}
@@ -259,7 +295,8 @@
 
 		html.push('<table class="tensor"><thead><tr><th></th>');
 		for (let c = 0; c < columns; c++) {
-			html.push('<th>' + c + '</th>');
+			// A struct labels its columns by field name; everything else by index.
+			html.push('<th>' + escapeHtml(data.headers ? data.headers[c] : c) + '</th>');
 		}
 		html.push('</tr></thead><tbody>');
 

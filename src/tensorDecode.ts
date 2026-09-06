@@ -53,10 +53,17 @@ export const DTYPES: readonly DTypeInfo[] = [
 export const MAX_ELEMENTS = 65536;
 
 /**
- * The pseudo-type that means "the user's own decoder". There is no stride to
- * derive a byte count from, so a script window is sized in bytes directly.
+ * The pseudo-types that mean "the user's own decoder" - a JavaScript snippet,
+ * or a C struct definition. Neither has a stride to derive a byte count from,
+ * so their windows are sized in bytes directly and the raw window crosses to
+ * the webview untouched.
  */
 export const SCRIPT_DTYPE = 'script';
+export const STRUCT_DTYPE = 'struct';
+
+export function isRawDType(value: unknown): boolean {
+	return value === SCRIPT_DTYPE || value === STRUCT_DTYPE;
+}
 
 /** Ceiling on a script window: it crosses to the webview as base64. */
 export const MAX_SCRIPT_BYTES = 1024 * 1024;

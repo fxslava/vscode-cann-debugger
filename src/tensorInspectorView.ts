@@ -27,8 +27,10 @@ import {
 	MAX_SCRIPT_BYTES,
 	parseByteCount,
 	parseShape,
+	isRawDType,
 	SCRIPT_DTYPE,
 	shapeElements,
+	STRUCT_DTYPE,
 	TensorDType,
 	tensorStats,
 } from './tensorDecode';
@@ -51,7 +53,7 @@ export interface TensorSeed {
  */
 type TensorMode =
 	| { kind: 'decode'; dtype: TensorDType }
-	| { kind: 'script'; bytes: number };
+	| { kind: 'raw'; bytes: number };
 
 /** One fully-specified read. */
 interface TensorRequest {
@@ -166,7 +168,7 @@ export class TensorInspectorPanel {
 		}
 
 		const elements = shapeElements(request.shape);
-		const count = request.mode.kind === 'script'
+		const count = request.mode.kind === 'raw'
 			? request.mode.bytes
 			: elements * dtypeInfo(request.mode.dtype).size;
 
@@ -182,7 +184,7 @@ export class TensorInspectorPanel {
 			const address = response?.address ?? request.address;
 			const unreadable = response?.unreadableBytes ?? 0;
 
-			if (request.mode.kind === 'script') {
+			if (request.mode.kind === 'raw') {
 				// The window goes over untouched: the script is the decoder,
 				// so this side has no business deciding what the bytes mean.
 				this.post({
@@ -248,13 +250,13 @@ export class TensorInspectorPanel {
 		}
 
 		const dtype = body['dtype'];
-		if (dtype === SCRIPT_DTYPE) {
+		if (isRawDType(dtype)) {
 			// No stride to multiply out, so the window is sized in bytes.
 			const bytes = parseByteCount(String(body['bytes'] ?? ''));
 			if (bytes === undefined) {
 				return `Bytes must be a whole number from 1 to ${MAX_SCRIPT_BYTES.toLocaleString()}.`;
 			}
-			return { address, shape, offset, mode: { kind: 'script', bytes } };
+			return { address, shape, offset, mode: { kind: 'raw', bytes } };
 		}
 		if (!isTensorDType(dtype)) {
 			return `Unknown data type: ${String(dtype)}.`;
@@ -284,7 +286,9 @@ export class TensorInspectorPanel {
 
 		const options = DTYPES
 			.map((d) => `<option value="${d.id}">${d.label}</option>`)
-			.concat(`<option value="${SCRIPT_DTYPE}">Custom script...</option>`)
+			.concat(
+				`<option value="${STRUCT_DTYPE}">C struct...</option>`,
+				`<option value="${SCRIPT_DTYPE}">Custom script...</option>`)
 			.join('\n\t\t\t');
 
 		return `<!DOCTYPE html>
@@ -322,19 +326,25 @@ export class TensorInspectorPanel {
 		</div>
 	</div>
 
-	<div id="scriptPanel" hidden>
+	<div id="customPanel" hidden>
 		<div class="toolbar">
 			<div class="field narrow">
 				<label for="bytes">Bytes</label>
 				<input type="text" id="bytes" spellcheck="false" autocomplete="off" value="1024">
 			</div>
-			<p class="hint grow">
+			<p class="hint grow" id="scriptHint">
 				Body of a function of <code>(buffer, shape)</code>. <code>buffer</code> is a
 				<code>Uint8Array</code> of the window above; return a 2-D array of numbers or
 				strings, one array per row. A flat array counts as a single row.
 			</p>
+			<p class="hint grow" id="structHint" hidden>
+				One row per struct in the window. Little-endian, LP64, natural alignment -
+				add <code>__attribute__((packed))</code> for none. Bitfields, fixed arrays
+				and <code>__fp16</code>/<code>__bf16</code> are understood.
+			</p>
 		</div>
 		<textarea id="script" spellcheck="false" rows="14"></textarea>
+		<textarea id="struct" spellcheck="false" rows="10" hidden></textarea>
 	</div>
 
 	<div class="field checkbox">
@@ -349,6 +359,7 @@ export class TensorInspectorPanel {
 	</div>
 
 	<script nonce="${nonce}" src="${asset('tensorScript.js')}"></script>
+	<script nonce="${nonce}" src="${asset('tensorStruct.js')}"></script>
 	<script nonce="${nonce}" src="${asset('tensorInspector.js')}"></script>
 </body>
 </html>`;

@@ -125,6 +125,26 @@ function handle(token: string, command: string): void {
 	// A CLI command run through MI answers on the ~ console stream, which the
 	// adapter captures to return as the evaluate result.
 	if (command.startsWith('-interpreter-exec console')) {
+		const inner = /"(.*)"\s*$/.exec(command)?.[1] ?? '';
+
+		// `info address` is how the adapter learns which locals live in a
+		// register: there is no MI command that reports it.
+		const address = /^info address (\w+)$/.exec(inner);
+		if (address) {
+			const name = address[1];
+			if (name === 'xGm') {
+				out(`~"Symbol \\"${name}\\" is a variable in register $x0.\\n"`);
+			} else if (name === 'scores') {
+				out(`~"Symbol \\"${name}\\" is a variable in register $v0.\\n"`);
+			} else {
+				// The common case, and the one that must NOT be read as a
+				// binding: it names a register but the variable is on the stack.
+				out(`~"Symbol \\"${name}\\" is a variable at frame base reg $x29 offset 20.\\n"`);
+			}
+			done(token);
+			return;
+		}
+
 		out('~"x0             0x2000              8192\\n"');
 		done(token);
 		return;
@@ -416,14 +436,16 @@ function handle(token: string, command: string): void {
 	}
 
 	if (command.startsWith('-data-list-register-names')) {
-		done(token, 'register-names=["x0","x1","pc"]');
+		// One of each group, so the folders have something to hold.
+		done(token, 'register-names=["x0","x1","pc","v0","cpsr"]');
 		return;
 	}
 
 	if (command.startsWith('-data-list-register-values')) {
 		done(token,
 			'register-values=[{number="0",value="0x2000"},{number="1",value="0x0"},' +
-			'{number="2",value="0x400546"}]');
+			'{number="2",value="0x400546"},{number="3",value="0x1234"},' +
+			'{number="4",value="0x60000000"}]');
 		return;
 	}
 

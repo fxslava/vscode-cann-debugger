@@ -144,20 +144,69 @@ test('publishes configured NPU regions as addressable entries', async () => {
 	assert.match(ub.value, /16 B/);
 });
 
+test('groups registers into folders instead of one flat wall', async () => {
+	const folders = await registerFolders();
+	assert.deepEqual(folders.map((f) => f.name),
+		['Vector Registers', 'Scalar Registers', 'System Registers']);
+	// Each folder says how much is inside without being opened.
+	assert.equal(folders.find((f) => f.name === 'Vector Registers')!.value, '1 registers');
+	assert.equal(folders.find((f) => f.name === 'Scalar Registers')!.value, '2 registers');
+	assert.ok(folders.every((f) => f.variablesReference > 0), 'every folder must open');
+});
+
 test('registers holding addresses get a memoryReference', async () => {
+	const scalars = await registersIn('Scalar Registers');
+	assert.equal(scalars.get('x0')?.memoryReference, '0x2000');
+	// A zero register points nowhere useful, so it gets no reference.
+	assert.equal(scalars.get('x1')?.memoryReference, undefined);
+
+	// pc is not general-purpose, so it files under System.
+	const system = await registersIn('System Registers');
+	assert.match(system.get('pc')!.value, /^0x400546/);
+	assert.equal(system.has('cpsr'), true);
+	// ...and the vector file is its own folder.
+	const vectors = await registersIn('Vector Registers');
+	assert.equal(vectors.has('v0'), true);
+	assert.equal(vectors.has('x0'), false);
+});
+
+test('annotates the registers that hold a local variable', async () => {
+	// The connection a register view cannot otherwise show: a local with no
+	// address, because it lives in a register.
+	const scalars = await registersIn('Scalar Registers');
+	assert.equal(scalars.get('x0')!.value, '0x2000 [mapped to: xGm]');
+
+	const vectors = await registersIn('Vector Registers');
+	assert.equal(vectors.get('v0')!.value, '0x1234 [mapped to: scores]');
+
+	// x29 is named by every stack local's `info address` answer, but holds
+	// none of them: reading that as a binding would label it with the frame.
+	const system = await registersIn('System Registers');
+	assert.equal(/mapped to/.test(system.get('pc')!.value), false);
+	assert.equal(scalars.get('x1')!.value, '0x0');
+});
+
+/** The Registers scope's folder rows. */
+async function registerFolders(): Promise<DebugProtocol.Variable[]> {
 	const frameId = await topFrameId();
 	const scopes = await client.send<DebugProtocol.ScopesResponse>('scopes', { frameId });
 	const registers = scopes.body.scopes.find((s) => s.name === 'Registers')!;
-
 	const variables = await client.send<DebugProtocol.VariablesResponse>('variables', {
 		variablesReference: registers.variablesReference,
 	});
-	const byName = new Map(variables.body.variables.map((v) => [v.name, v]));
-	assert.equal(byName.get('x0')?.memoryReference, '0x2000');
-	// A zero register points nowhere useful, so it gets no reference.
-	assert.equal(byName.get('x1')?.memoryReference, undefined);
-	assert.equal(byName.get('pc')?.value, '0x400546');
-});
+	return variables.body.variables;
+}
+
+/** The registers inside one folder, by name. */
+async function registersIn(folder: string): Promise<Map<string, DebugProtocol.Variable>> {
+	const folders = await registerFolders();
+	const found = folders.find((f) => f.name === folder);
+	assert.ok(found, `${folder} missing from the Registers scope`);
+	const variables = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: found.variablesReference,
+	});
+	return new Map(variables.body.variables.map((v) => [v.name, v]));
+}
 
 test('replaces the broken std::vector summary with synthetic children', async () => {
 	const scores = await local('scores');
