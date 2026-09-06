@@ -122,6 +122,14 @@ const STOP_FRAME =
 	`fullname="${GUEST_SOURCE}",line="42"}`;
 
 function handle(token: string, command: string): void {
+	// A CLI command run through MI answers on the ~ console stream, which the
+	// adapter captures to return as the evaluate result.
+	if (command.startsWith('-interpreter-exec console')) {
+		out('~"x0             0x2000              8192\\n"');
+		done(token);
+		return;
+	}
+
 	// Setup and bookkeeping commands that only need an acknowledgement.
 	if (/^-(gdb-set|enable-pretty-printing|environment-cd|file-exec-and-symbols|var-delete|interpreter-exec)\b/.test(command)) {
 		done(token);
@@ -151,6 +159,14 @@ function handle(token: string, command: string): void {
 		out(`${token}^running`);
 		prompt();
 		setTimeout(() => {
+			// GDB talking about itself. The & log stream is GDB echoing the
+			// commands we sent it, which is what floods the Debug Console.
+			out('&"-stack-list-variables --thread 1 --frame 0 --no-values\\n"');
+			out('~"[New Thread 0x7ffd (LWP 4242)]\\n"');
+			// The debuggee talking: the @ target stream, and - under WSL, where
+			// the debuggee shares GDB\'s stdout - a plain non-MI line.
+			out('@"AddCustom: tile 0 of 8\\n"');
+			out('kernel printf via shared stdout');
 			out('*stopped,reason="breakpoint-hit",disp="keep",bkptno="1",' +
 				`${STOP_FRAME},thread-id="1",stopped-threads="all",core="0"`);
 			prompt();

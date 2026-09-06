@@ -7,161 +7,21 @@
  *-------------------------------------------------------------------------*/
 
 import assert from 'node:assert/strict';
-import { ChildProcess, spawn } from 'node:child_process';
-import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { DebugProtocol } from '@vscode/debugprotocol';
+
+import { closeFixture, DapClient, Fixture, HOST_SOURCE, launchFixture } from './dapClient';
 import { decodeTensor, formatValue, gridShape, shapeElements } from '../tensorDecode';
 
-const OUT_DIR = join(__dirname, '..');
-const ADAPTER = join(OUT_DIR, 'debugAdapter.js');
-const FAKE_GDB_JS = join(__dirname, 'fakeGdb.js');
-const HOST_SOURCE = 'D:\\Projects\\vllm-ascend\\csrc\\tests\\add_custom.cpp';
-
-/** Minimal DAP client: Content-Length framing over the adapter's stdio. */
-class DapClient {
-	private buffer = Buffer.alloc(0);
-	private seq = 1;
-	private readonly pending = new Map<number, {
-		resolve: (r: DebugProtocol.Response) => void;
-		reject: (e: Error) => void;
-	}>();
-	private readonly events: DebugProtocol.Event[] = [];
-	private readonly eventWaiters: Array<{ event: string; resolve: (e: DebugProtocol.Event) => void }> = [];
-
-	constructor(private readonly proc: ChildProcess) {
-		proc.stdout!.on('data', (chunk: Buffer) => this.onData(chunk));
-	}
-
-	public send<T extends DebugProtocol.Response>(command: string, args?: unknown): Promise<T> {
-		const request: DebugProtocol.Request = {
-			seq: this.seq++, type: 'request', command, arguments: args,
-		};
-		const json = JSON.stringify(request);
-		this.proc.stdin!.write(`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
-		return new Promise((resolve, reject) => {
-			this.pending.set(request.seq, { resolve: resolve as never, reject });
-		});
-	}
-
-	public waitForEvent(event: string, timeoutMs = 5000): Promise<DebugProtocol.Event> {
-		const already = this.events.find((e) => e.event === event);
-		if (already) {
-			return Promise.resolve(already);
-		}
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(
-				() => reject(new Error(`Timed out waiting for "${event}" event`)), timeoutMs);
-			this.eventWaiters.push({
-				event,
-				resolve: (e) => {
-					clearTimeout(timer);
-					resolve(e);
-				},
-			});
-		});
-	}
-
-	private onData(chunk: Buffer): void {
-		this.buffer = Buffer.concat([this.buffer, chunk]);
-		for (;;) {
-			const headerEnd = this.buffer.indexOf('\r\n\r\n');
-			if (headerEnd < 0) {
-				return;
-			}
-			const header = this.buffer.subarray(0, headerEnd).toString('utf8');
-			const length = Number(/Content-Length: (\d+)/i.exec(header)?.[1] ?? 0);
-			const bodyStart = headerEnd + 4;
-			if (this.buffer.length < bodyStart + length) {
-				return;
-			}
-			const body = this.buffer.subarray(bodyStart, bodyStart + length).toString('utf8');
-			this.buffer = this.buffer.subarray(bodyStart + length);
-			this.dispatch(JSON.parse(body));
-		}
-	}
-
-	private dispatch(message: DebugProtocol.ProtocolMessage): void {
-		if (message.type === 'response') {
-			const response = message as DebugProtocol.Response;
-			const pending = this.pending.get(response.request_seq);
-			if (pending) {
-				this.pending.delete(response.request_seq);
-				pending.resolve(response);
-			}
-			return;
-		}
-		if (message.type === 'event') {
-			const event = message as DebugProtocol.Event;
-			this.events.push(event);
-			const index = this.eventWaiters.findIndex((w) => w.event === event.event);
-			if (index >= 0) {
-				this.eventWaiters.splice(index, 1)[0].resolve(event);
-			}
-		}
-	}
-}
-
-let adapter: ChildProcess;
+let fixture: Fixture;
 let client: DapClient;
 
 before(async () => {
-	adapter = spawn(process.execPath, [ADAPTER], { stdio: ['pipe', 'pipe', 'pipe'] });
-	adapter.stderr!.on('data', (d: Buffer) => process.stderr.write(`[adapter] ${d}`));
-	client = new DapClient(adapter);
-
-	const init = await client.send<DebugProtocol.InitializeResponse>('initialize', {
-		adapterID: 'ascend-gdb',
-		linesStartAt1: true,
-		columnsStartAt1: true,
-		pathFormat: 'path',
-		supportsMemoryReferences: true,
-	});
-	assert.ok(init.success, 'initialize failed');
-	assert.equal(init.body?.supportsReadMemoryRequest, true);
-	assert.equal(init.body?.supportsWriteMemoryRequest, true);
-
-	const launched = client.send<DebugProtocol.LaunchResponse>('launch', {
-		type: 'ascend-gdb',
-		request: 'launch',
-		name: 'test',
-		program: 'D:\\Projects\\vllm-ascend\\csrc\\tests\\build\\test_kernel',
-		cwd: 'D:\\Projects\\vllm-ascend\\csrc\\tests',
-		// Run the fake through Node itself: gdbArgs precede --interpreter, so
-		// this becomes `node fakeGdb.js --interpreter=mi2 -q`.
-		gdbPath: process.execPath,
-		gdbArgs: [FAKE_GDB_JS],
-		// No WSL indirection for the fake, but path translation stays on -
-		// the same combination a Windows host uses against a remote gdbserver.
-		wsl: { enabled: false },
-		pathTranslation: 'on',
-		sourceFileMap: { '/mnt/d/Projects/vllm-ascend': 'D:\\Projects\\vllm-ascend' },
-		npuMemoryRegions: [{ name: 'UB', address: '0x2000', size: 16, description: 'Unified Buffer' }],
-	});
-
-	await client.waitForEvent('initialized');
-
-	const breakpoints = await client.send<DebugProtocol.SetBreakpointsResponse>('setBreakpoints', {
-		source: { path: HOST_SOURCE },
-		breakpoints: [{ line: 42 }],
-	});
-	assert.ok(breakpoints.success, `setBreakpoints failed: ${breakpoints.message}`);
-	assert.equal(breakpoints.body.breakpoints[0].verified, true,
-		'breakpoint was rejected - the Windows path was probably not translated');
-
-	await client.send('configurationDone', {});
-	await launched;
-	await client.waitForEvent('stopped');
+	fixture = await launchFixture();
+	client = fixture.client;
 });
 
-after(async () => {
-	try {
-		await client.send('disconnect', { terminateDebuggee: true });
-	} catch {
-		/* adapter may already be gone */
-	}
-	adapter?.kill();
-});
+after(() => closeFixture(fixture));
 
 test('translates the Windows breakpoint path into the guest and back', async () => {
 	const response = await client.send<DebugProtocol.SetBreakpointsResponse>('setBreakpoints', {
@@ -517,6 +377,44 @@ test('the same window decodes differently when the type changes', async () => {
 	assert.equal(decodeTensor(bytes, 'float32', 4).length, 4);
 	// 0x0100 as a half is a subnormal, which is what these bytes really are.
 	assert.equal(decodeTensor(bytes, 'float16', 8)[0], 256 * 2 ** -24);
+});
+
+test('the Debug Console carries the kernel output and nothing else', async () => {
+	// Everything the run emitted has already been collected: the fixture waits
+	// for the stop, and these all arrived ahead of it.
+	const stdout = client.output('stdout');
+	// The @ target stream.
+	assert.match(stdout, /AddCustom: tile 0 of 8/);
+	// A plain non-MI line: under WSL the debuggee shares GDB's stdout.
+	assert.match(stdout, /kernel printf via shared stdout/);
+
+	const consoleText = client.output('console');
+	// GDB's & log stream is its echo of our own commands - the actual flood.
+	assert.equal(consoleText.includes('-stack-list-variables'), false,
+		`MI traffic reached the console:\n${consoleText}`);
+	// Its ~ console stream is chatter about GDB's own state.
+	assert.equal(consoleText.includes('New Thread'), false);
+	// And none of the dialogue the adapter itself drives.
+	assert.equal(/-var-create|-exec-run|\^done|<--|-->/.test(consoleText), false,
+		`MI dialogue reached the console:\n${consoleText}`);
+
+	// The program's output must not be diverted into the trace instead.
+	assert.equal(consoleText.includes('AddCustom: tile 0 of 8'), false);
+});
+
+test('a REPL command answers once, not twice', async () => {
+	// The ~ stream carrying the answer is captured to become the result; if it
+	// were also forwarded as output, every command would print twice.
+	const before = client.output('console');
+	const response = await client.send<DebugProtocol.EvaluateResponse>('evaluate', {
+		expression: 'info registers',
+		context: 'repl',
+	});
+	assert.ok(response.success, `repl evaluate failed: ${response.message}`);
+	// The answer comes back as the result...
+	assert.match(response.body.result, /x0\s+0x2000\s+8192/);
+	// ...and not a second time as console output.
+	assert.equal(client.output('console'), before);
 });
 
 /** One local by name, re-read from a fresh scope each time. */

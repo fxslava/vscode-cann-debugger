@@ -141,6 +141,8 @@ export class AscendDebugSession extends LoggingDebugSession {
 	private readonly formatters: TypeFormatterRegistry = createDefaultFormatterRegistry();
 
 	private config!: AscendArguments;
+	/** Mirror the MI dialogue into the Debug Console; see `trace`. */
+	private traceMi = false;
 	private executionMode: ExecutionMode = 'wsl';
 	private isAttach = false;
 	private terminated = false;
@@ -232,10 +234,14 @@ export class AscendDebugSession extends LoggingDebugSession {
 		this.config = args;
 		this.isAttach = isAttach;
 
-		const engineLogging = args.logging?.engineLogging === true;
-		// DAP-level tracing is separate: it echoes every protocol message and
-		// would bury the MI dialogue that engineLogging is actually for.
-		logger.setup(args.logging?.trace ? Logger.LogLevel.Verbose : Logger.LogLevel.Stop, false);
+		// `logging.engineLogging` is the older spelling of the same switch.
+		this.traceMi = args.trace === true || args.logging?.engineLogging === true;
+		// The log file gets the MI dialogue whenever either kind of tracing is
+		// on; DAP-level tracing additionally echoes every protocol message,
+		// which would bury the MI traffic it sits next to.
+		logger.setup(
+			args.logging?.trace || this.traceMi ? Logger.LogLevel.Verbose : Logger.LogLevel.Stop,
+			false);
 
 		const mode = resolveExecutionMode(args);
 		this.executionMode = mode;
@@ -248,8 +254,7 @@ export class AscendDebugSession extends LoggingDebugSession {
 		});
 		this.varManager = new VarObjectManager(this.mi);
 
-		this.mi.engineLogging = engineLogging;
-		this.mi.onEngineLog = (text) => this.sendEvent(new OutputEvent(text, 'console'));
+		this.mi.onEngineLog = (text) => this.trace(text);
 		this.wireMiEvents();
 
 		try {
@@ -419,8 +424,11 @@ export class AscendDebugSession extends LoggingDebugSession {
 			void this.handleExecAsync(record);
 		});
 		this.mi.on('notify', (record) => this.handleNotifyAsync(record));
-		this.mi.on('console', (text) => this.sendEvent(new OutputEvent(text, 'console')));
-		this.mi.on('log', (text) => this.sendEvent(new OutputEvent(text, 'console')));
+		// `~` and `&` are GDB talking about itself; `@` and everything that is
+		// not MI at all is the debuggee talking. Only the latter is what the
+		// user came to see.
+		this.mi.on('console', (text) => this.trace(text));
+		this.mi.on('log', (text) => this.trace(text));
 		this.mi.on('target', (text) => this.emitProgramOutput(text));
 		this.mi.on('inferior', (text) => this.emitProgramOutput(text));
 		this.mi.on('error', (err) =>
@@ -438,6 +446,25 @@ export class AscendDebugSession extends LoggingDebugSession {
 			return;
 		}
 		this.sendEvent(new OutputEvent(text, 'stdout'));
+	}
+
+	/**
+	 * Diagnostics, as opposed to output: always to the adapter's log file, and
+	 * to the Debug Console only when the user asked for tracing.
+	 *
+	 * This is where GDB's own chatter goes - the `~` console stream and the
+	 * `&` log stream. The `&` stream is GDB echoing back every command the
+	 * adapter sends it, and the adapter sends a lot of them: a varobj per
+	 * visible variable on every stop. Forwarding that to the Debug Console is
+	 * what buries the kernel's printf output, and it is also what made every
+	 * REPL command print its answer twice - once as the evaluate result and
+	 * once as the echoed stream.
+	 */
+	private trace(text: string): void {
+		logger.verbose(text.replace(/\n+$/, ''));
+		if (this.traceMi) {
+			this.sendEvent(new OutputEvent(text, 'console'));
+		}
 	}
 
 	/* ---------------------------------------------------------------------

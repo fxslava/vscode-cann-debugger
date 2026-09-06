@@ -62,8 +62,11 @@ export class MiConnection extends EventEmitter {
 	private guestPid?: number;
 	private exited = false;
 
-	/** Set by the owner to mirror the MI dialogue into the Debug Console. */
-	public engineLogging = false;
+	/**
+	 * Every line of the MI dialogue, in both directions. Called unconditionally
+	 * - where it ends up, log file or Debug Console or nowhere, is the owner's
+	 * policy to decide, not this layer's.
+	 */
 	public onEngineLog?: (text: string) => void;
 
 	public get isRunning(): boolean {
@@ -295,7 +298,7 @@ export class MiConnection extends EventEmitter {
 
 	private handleLine(line: string): void {
 		const record = parseMiLine(line);
-		if (this.engineLogging && record.type !== MiRecordType.Prompt) {
+		if (record.type !== MiRecordType.Prompt) {
 			this.log(`<-- ${line}\n`);
 		}
 
@@ -364,9 +367,7 @@ export class MiConnection extends EventEmitter {
 	}
 
 	private log(text: string): void {
-		if (this.engineLogging) {
-			this.onEngineLog?.(text);
-		}
+		this.onEngineLog?.(text);
 	}
 }
 

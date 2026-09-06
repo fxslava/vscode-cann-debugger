@@ -73,6 +73,27 @@ test('unescapes C strings in stream records', () => {
 	assert.equal(record.text, 'Breakpoint 1 at 0x400546: file "add_custom.cpp", line 42.\n');
 });
 
+test('distinguishes the three stream records', () => {
+	// ~ is GDB talking to the user, @ is the debuggee, & is GDB's own log.
+	assert.equal(parseMiLine('~"symbols loaded\\n"').type, MiRecordType.ConsoleStream);
+	assert.equal(parseMiLine('@"kernel output\\n"').type, MiRecordType.TargetStream);
+	assert.equal(parseMiLine('&"-exec-run\\n"').type, MiRecordType.LogStream);
+
+	assert.equal(parseMiLine('@"tile 0 of 8\\n"').text, 'tile 0 of 8\n');
+	assert.equal(parseMiLine('&"-stack-list-variables\\n"').text, '-stack-list-variables\n');
+});
+
+test('unescapes the rest of the C escapes a stream record can carry', () => {
+	// Tabs and carriage returns survive a printf-heavy kernel.
+	assert.equal(parseMiLine('@"a\\tb\\r\\n"').text, 'a\tb\r\n');
+	assert.equal(parseMiLine('@"back\\\\slash"').text, 'back\\slash');
+	// Octal and hex escapes: GDB uses them for non-printable bytes.
+	assert.equal(parseMiLine('@"\\033[31m"').text, '\x1b[31m');
+	assert.equal(parseMiLine('@"\\x41\\x42"').text, 'AB');
+	// An unterminated string means GDB truncated the line; keep what arrived.
+	assert.equal(parseMiLine('@"half a line').text, 'half a line');
+});
+
 test('handles empty tuples, empty lists and the prompt', () => {
 	assert.deepEqual(parseMiLine('^done,threads=[],groups={}').results['threads'], []);
 	assert.equal(parseMiLine('(gdb)').type, MiRecordType.Prompt);

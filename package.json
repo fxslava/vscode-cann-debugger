@@ -511,12 +511,17 @@
                 },
                 "default": []
               },
+              "trace": {
+                "type": "boolean",
+                "description": "Mirror the GDB/MI dialogue - commands, replies, and GDB's own chatter - into the Debug Console. Off by default so the console carries only the debuggee's output; the traffic is written to the adapter log file either way.",
+                "default": false
+              },
               "logging": {
                 "type": "object",
                 "properties": {
                   "engineLogging": {
                     "type": "boolean",
-                    "description": "Echo every GDB/MI command and response to the Debug Console.",
+                    "description": "Older spelling of the top-level \"trace\".",
                     "default": false
                   },
                   "programOutput": {
@@ -526,7 +531,7 @@
                   },
                   "trace": {
                     "type": "boolean",
-                    "description": "Echo every DAP message. Very noisy; only useful when working on the adapter itself.",
+                    "description": "Echo every DAP protocol message - not GDB/MI, which is the top-level \"trace\". Only useful when working on the adapter itself.",
                     "default": false
                   }
                 },
@@ -787,6 +792,11 @@
                   "off"
                 ],
                 "default": "auto"
+              },
+              "trace": {
+                "type": "boolean",
+                "description": "Mirror the GDB/MI dialogue into the Debug Console. Off by default; the traffic is written to the adapter log file either way.",
+                "default": false
               },
               "logging": {
                 "type": "object",

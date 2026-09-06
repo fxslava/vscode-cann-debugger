@@ -62,10 +62,21 @@ export interface AscendCommonArguments {
 	npuMemoryRegions?: NpuMemoryRegion[];
 	memoryReferences?: 'auto' | 'all' | 'off';
 
+	/**
+	 * Mirror the GDB/MI dialogue - the commands the adapter sends, GDB's
+	 * replies, and GDB's own `~`/`&` chatter - into the Debug Console.
+	 *
+	 * Off by default, so the console carries the debuggee's output and nothing
+	 * else. The traffic is still written to the adapter's log file either way,
+	 * so a session can be diagnosed after the fact without re-running it.
+	 */
+	trace?: boolean;
+
 	logging?: {
+		/** Older spelling of the top-level `trace`. */
 		engineLogging?: boolean;
 		programOutput?: boolean;
-		/** DAP-level tracing from the base adapter. Very noisy; for adapter work. */
+		/** DAP-level tracing from the base adapter: every protocol message. */
 		trace?: boolean;
 	};
 }
