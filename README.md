@@ -88,6 +88,118 @@ builders, and an end-to-end pass that spawns the real adapter process, speaks
 real DAP over stdio, and answers it with a fake MI debugger
 (`src/test/fakeGdb.ts`).
 
+## Ascend NPU Target Manager
+
+The Ascend icon in the activity bar opens a form that replaces hand-editing
+`launch.json`: pick a target, press **Deploy & Debug**, and the extension saves
+the configuration, copies the binary if the target is real hardware, and starts
+the session.
+
+| Field | Meaning |
+| --- | --- |
+| **Execution Mode** | *Docker Simulator* runs the debugger in the CANN container (`execution.mode: "docker"`); *Remote NPU Hardware* runs it on a device over SSH (`execution.mode: "ssh"`). |
+| **Target Host / IP**, **Port** | Where sshd is listening, e.g. `192.168.1.100:22`. |
+| **SSH Username** | The remote account, typically `HwHiAiUser` or `root`. |
+| **SSH Password** | Write-only. Posted once, stored in VS Code Secret Storage, then cleared from the form. |
+| **Private Key** | Optional. When set, the password is ignored entirely. |
+| **Deploy Path** | Absolute directory on the target. The ELF is copied here and `chmod 0755`. |
+| **Binary (ELF)** | Host path of the build output; `${workspaceFolder}` is expanded. |
+
+**Save** writes everything except the password to `ascend-gdb.target` in
+`.vscode/settings.json`, and — unless you clear the checkbox — mirrors the
+generated configuration into `.vscode/launch.json` as *Ascend NPU: Deploy &
+Debug*. Hand-written configurations in that file are left alone.
+
+**Test Connection** logs in, reports `uname`, checks that `gdbPath` exists and
+is executable, and prints the first lines of `npu-smi info -l`. It is the
+cheapest way to tell a wrong password from a wrong debugger path.
+
+### Where the password lives
+
+Nowhere on disk in clear text, and nowhere another extension can read it.
+
+```
+webview  ──postMessage──▶  TargetViewProvider  ──▶  context.secrets   (OS keychain)
+                                                        │
+                          DebugAdapterDescriptorFactory ─┘
+                                     │  options.env.ASCEND_SSH_PASSWORD
+                                     ▼
+                             debugAdapter.js  ──▶  SSHPASS=…  sshpass -e ssh …
+```
+
+The secret is keyed `ascend-gdb.ssh.password:<user>@<host>:<port>`, so pointing
+the view at a second box does not silently reuse the first box's password.
+
+Two things it is deliberately **not**: part of the debug configuration (which
+`session.configuration` exposes to every other extension, and which lands in
+`launch.json` the moment you save it), and part of the ssh command line (argv
+is world-readable through `/proc` on the machine running the client). It rides
+in the environment of one process VS Code spawns for one session, and
+`sshLauncher` copies it into `SSHPASS` for the ssh child and nowhere else.
+
+**Trust on first use.** The first connection to a host shows its SHA256
+fingerprint and asks you to confirm it; the key is pinned afterwards, and a
+changed key is reported rather than accepted. The adapter's own ssh client
+enforces the same policy through `StrictHostKeyChecking=accept-new`.
+
+### Remote hardware requirements
+
+- `sshpass` where the ssh client runs — inside the WSL distro on Windows, which
+  is what `execution.ssh.viaWsl` defaults to, because Windows ships an OpenSSH
+  client but no `sshpass`. `sudo apt-get install sshpass`. Set
+  `execution.ssh.identityFile` to use key authentication instead and skip it.
+- CANN and `msdebug-mi` installed **on the device**; only the ELF is deployed.
+- The WSL distro must be able to route to the NPU host, since that is where the
+  ssh client runs.
+
+Deploy uses `ssh2` over SFTP rather than the CLI: it needs progress reporting
+and structured errors, and it works on a Windows host with no `scp` in sight.
+The MI stream keeps using the ssh CLI, which wants nothing but a clean pipe.
+
+## Registering the view in package.json
+
+The contributions the Target Manager needs, all already present:
+
+```jsonc
+"activationEvents": ["onDebugResolve:ascend-gdb", "onView:ascend-gdb.targetManager"],
+"contributes": {
+  "viewsContainers": {
+    "activitybar": [
+      { "id": "ascend", "title": "Ascend NPU", "icon": "media/ascend.svg" }
+    ]
+  },
+  "views": {
+    "ascend": [
+      {
+        "type": "webview",                       // required for a WebviewViewProvider
+        "id": "ascend-gdb.targetManager",        // must match TargetViewProvider.viewType
+        "name": "Target Manager",
+        "icon": "media/ascend.svg",
+        "contextualTitle": "Ascend NPU Target Manager"
+      }
+    ]
+  },
+  "commands": [
+    { "command": "ascend-gdb.deployAndDebug", "title": "Deploy & Debug on Ascend Target",
+      "category": "Ascend", "icon": "$(rocket)" },
+    { "command": "ascend-gdb.openTargetManager", "title": "Open NPU Target Manager",
+      "category": "Ascend" }
+  ],
+  "menus": {
+    "view/title": [
+      { "command": "ascend-gdb.deployAndDebug",
+        "when": "view == ascend-gdb.targetManager", "group": "navigation" }
+    ]
+  },
+  "configuration": { "properties": { "ascend-gdb.target": { "type": "object", "…": "…" } } }
+}
+```
+
+`media/**` must stay out of `.vscodeignore` — the webview loads its stylesheet
+and script from there, and `localResourceRoots` is restricted to that folder.
+`node_modules/**` must stay out of it too: `@vscode/debugadapter` and `ssh2`
+are runtime dependencies, and `vsce` already prunes `devDependencies` itself.
+
 ## launch.json
 
 ```jsonc
@@ -155,6 +267,14 @@ VS Code UI  ──DAP over stdio──▶  debugAdapter.js (own Node process)
                         /bin/bash -lc ". set_env.sh; exec msdebug-mi --interpreter=mi2"
                                         │
                                 msdebug-mi ⇄ test binary ⇄ CANN simulator
+
+  … or, for real hardware (execution.mode: "ssh"):
+
+                    wsl.exe -d Ubuntu-22.04 -e            ← host boundary
+                      sshpass -e ssh -T user@10.0.0.5     ← network boundary
+                        "/bin/bash -lc '. set_env.sh; exec msdebug-mi …'"
+                                        │
+                                msdebug-mi ⇄ deployed ELF ⇄ Ascend NPU
 ```
 
 Each boundary is crossed with `-e` / `exec` rather than an intermediate shell,
@@ -174,6 +294,8 @@ Pause has something to signal.
 | `src/varObjects.ts` | Variable-object lifecycle and address resolution. |
 | `src/wslLauncher.ts` | Command line for every execution mode, plus the guest shell wrapper. |
 | `src/dockerLauncher.ts` | `docker exec` argv and its composition with the WSL hop. |
+| `src/sshLauncher.ts` | `ssh` / `sshpass` argv for a remote Ascend host, and the SSHPASS handoff. |
+| `src/targetManager/` | The sidebar webview: target form, SecretStorage, SFTP deploy, launch synthesis. |
 
 ### Why variable objects rather than `-stack-list-variables --all-values`
 
@@ -226,6 +348,8 @@ unchanged rather than being invented into a `D:\` path that does not exist.
 | --- | --- |
 | **Ascend: View NPU Memory Region…** | Resolve a configured region to a concrete address. |
 | **Ascend: Send Raw GDB/MI Command…** | Talk to the debugger directly; `-`-prefixed input is raw MI. |
+| **Ascend: Deploy & Debug on Ascend Target** | Run the Target Manager's primary action without opening the view. |
+| **Ascend: Open NPU Target Manager** | Focus the sidebar form. |
 
 The Debug Console REPL takes the same input: plain text runs as a console
 command, a leading `-` sends raw MI.

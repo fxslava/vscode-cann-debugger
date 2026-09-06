@@ -202,20 +202,30 @@ export class MiConnection extends EventEmitter {
 	/**
 	 * Interrupt the debuggee. Prefers `-exec-interrupt`; when the target is not
 	 * async-capable that fails, and we fall back to signalling GDB inside the
-	 * guest - Node cannot deliver SIGINT across the WSL boundary itself.
+	 * guest - Node cannot deliver SIGINT across the WSL, container or SSH
+	 * boundary itself.
 	 */
-	public async interrupt(wslSignalArgv?: string[]): Promise<boolean> {
+	public async interrupt(
+		signalArgv?: string[],
+		signalEnv?: NodeJS.ProcessEnv,
+	): Promise<boolean> {
 		try {
 			await this.sendCommand('-exec-interrupt --all');
 			return true;
 		} catch {
 			// fall through
 		}
-		if (wslSignalArgv && this.guestPid !== undefined) {
-			const argv = wslSignalArgv.concat(['kill', '-INT', String(this.guestPid)]);
+		if (signalArgv && this.guestPid !== undefined) {
+			const argv = signalArgv.concat(['kill', '-INT', String(this.guestPid)]);
 			this.log(`interrupt fallback: ${argv.join(' ')}\n`);
 			try {
-				spawn(argv[0], argv.slice(1), { windowsHide: true, stdio: 'ignore' }).unref();
+				// signalEnv carries SSHPASS in ssh mode; every other mode inherits
+				// the adapter's own environment unchanged.
+				spawn(argv[0], argv.slice(1), {
+					windowsHide: true,
+					stdio: 'ignore',
+					env: signalEnv ?? process.env,
+				}).unref();
 				return true;
 			} catch (err) {
 				this.log(`interrupt fallback failed: ${(err as Error).message}\n`);

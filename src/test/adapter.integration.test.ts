@@ -298,6 +298,138 @@ test('registers holding addresses get a memoryReference', async () => {
 	assert.equal(byName.get('pc')?.value, '0x400546');
 });
 
+test('replaces the broken std::vector summary with synthetic children', async () => {
+	const scores = await local('scores');
+
+	// The debugger's own answer here is "error: summary string parsing error"
+	// over a single _Vector_base child. None of that should reach the user.
+	assert.equal(scores.value, '{ size=4 }');
+	assert.equal(scores.type, 'std::vector<float, std::allocator<float> >');
+	assert.equal(scores.evaluateName, 'scores');
+	assert.equal(scores.indexedVariables, 4);
+	// The payload, not the address of the three-pointer header.
+	assert.equal(scores.memoryReference, '0x2000');
+	assert.ok(scores.variablesReference > 0, 'a non-empty vector must be expandable');
+
+	const children = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: scores.variablesReference,
+	});
+	assert.deepEqual(children.body.variables.map((v) => v.name), ['[0]', '[1]', '[2]', '[3]']);
+	assert.deepEqual(children.body.variables.map((v) => v.value), ['0.5', '1.5', '2.5', '3.5']);
+
+	const first = children.body.variables[0];
+	assert.equal(first.type, 'float');
+	// Re-evaluatable, so Add to Watch and Copy Value work on an element.
+	assert.equal(first.evaluateName, '*((scores)._M_impl._M_start + 0)');
+	// A float is a leaf: offering an expander would dead-end.
+	assert.equal(first.variablesReference, 0);
+
+	// Addresses are arithmetic off the payload base - 4 bytes per float - so
+	// every element opens the Hex Editor at the right place.
+	assert.deepEqual(
+		children.body.variables.map((v) => v.memoryReference),
+		['0x2000', '0x2004', '0x2008', '0x200c']);
+});
+
+test('a paged request reads only that page', async () => {
+	const scores = await local('scores');
+
+	const page = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: scores.variablesReference,
+		filter: 'indexed',
+		start: 1,
+		count: 2,
+	});
+	assert.deepEqual(page.body.variables.map((v) => v.name), ['[1]', '[2]']);
+	// fakeGdb derives each value from the absolute index it was asked for, so
+	// these values prove the offset reached the MI command itself rather than
+	// the adapter fetching all four and slicing afterwards.
+	assert.deepEqual(page.body.variables.map((v) => v.value), ['1.5', '2.5']);
+	assert.deepEqual(page.body.variables.map((v) => v.memoryReference), ['0x2004', '0x2008']);
+
+	// Synthetic children are all indexed; a named-filter request has nothing
+	// to answer with and must not return the indexed ones.
+	const named = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: scores.variablesReference,
+		filter: 'named',
+	});
+	assert.deepEqual(named.body.variables, []);
+});
+
+test('falls back to one read per element when the array cast is rejected', async () => {
+	// `weights` is the vector fakeGdb refuses to build an array type for -
+	// the behaviour seen with opaque and locally-defined element types.
+	const weights = await local('weights');
+	assert.equal(weights.value, '{ size=3 }');
+	assert.equal(weights.memoryReference, '0x3000');
+
+	const children = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: weights.variablesReference,
+	});
+	assert.deepEqual(children.body.variables.map((v) => v.name), ['[0]', '[1]', '[2]']);
+	assert.deepEqual(children.body.variables.map((v) => v.value), ['100.25', '101.25', '102.25']);
+	assert.equal(children.body.variables[0].type, 'double');
+	// 8-byte elements this time.
+	assert.deepEqual(
+		children.body.variables.map((v) => v.memoryReference),
+		['0x3000', '0x3008', '0x3010']);
+});
+
+test('a synthetic element expands back into the debugger', async () => {
+	// The nested case: the formatter hands out a reference for an element it
+	// has never evaluated, and expanding it re-enters the pipeline one level
+	// down. Nothing is evaluated until this request arrives.
+	const tilings = await local('tilings');
+	assert.equal(tilings.value, '{ size=2 }');
+	assert.equal(tilings.memoryReference, '0x4000');
+
+	const elements = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: tilings.variablesReference,
+	});
+	assert.deepEqual(elements.body.variables.map((v) => v.name), ['[0]', '[1]']);
+	const second = elements.body.variables[1];
+	assert.ok(second.variablesReference > 0, 'a struct element must be expandable');
+	// 8-byte structs, so the second one starts one stride in.
+	assert.equal(second.memoryReference, '0x4008');
+
+	const fields = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: second.variablesReference,
+	});
+	assert.deepEqual(fields.body.variables.map((v) => v.name), ['totalLength', 'tileNum']);
+	assert.equal(fields.body.variables[0].value, '2048');
+	// The path expression is rebuilt through the element, so the field is
+	// addressable in its own right rather than being a dead label.
+	assert.equal(fields.body.variables[1].evaluateName,
+		'(*((tilings)._M_impl._M_start + 1)).tileNum');
+});
+
+test('a watchpoint can be set on a synthetic element', async () => {
+	const scores = await local('scores');
+	const children = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: scores.variablesReference,
+	});
+
+	const info = await client.send<DebugProtocol.DataBreakpointInfoResponse>('dataBreakpointInfo', {
+		variablesReference: scores.variablesReference,
+		name: children.body.variables[2].name,
+	});
+	// The element's expression, not the literal row label "[2]".
+	assert.equal(info.body.dataId, '*((scores)._M_impl._M_start + 2)');
+});
+
+/** One local by name, re-read from a fresh scope each time. */
+async function local(name: string): Promise<DebugProtocol.Variable> {
+	const frameId = await topFrameId();
+	const scopes = await client.send<DebugProtocol.ScopesResponse>('scopes', { frameId });
+	const locals = scopes.body.scopes.find((s) => s.name === 'Locals')!;
+	const variables = await client.send<DebugProtocol.VariablesResponse>('variables', {
+		variablesReference: locals.variablesReference,
+	});
+	const found = variables.body.variables.find((v) => v.name === name);
+	assert.ok(found, `${name} missing from Locals`);
+	return found;
+}
+
 async function topFrameId(): Promise<number> {
 	const stack = await client.send<DebugProtocol.StackTraceResponse>('stackTrace', {
 		threadId: 1, startFrame: 0, levels: 1,

@@ -171,6 +171,41 @@ export function classifyType(type: string): TypeShape {
 }
 
 /**
+ * Evaluate `expression` in a frame and return it as an integer.
+ *
+ * The single primitive every address and size calculation is built on:
+ * memory references, and the pointer arithmetic the container formatters use
+ * to find where a std::vector's payload actually lives.
+ *
+ * Returns undefined when the expression cannot be evaluated (optimized out,
+ * not in scope, a synthetic value with no address) rather than throwing, so
+ * callers can degrade to "no memory reference" instead of failing a request.
+ */
+export async function evaluateInteger(
+	mi: MiConnection,
+	expression: string,
+	threadId: number,
+	frameLevel: number,
+): Promise<bigint | undefined> {
+	if (!expression) {
+		return undefined;
+	}
+	try {
+		const record = await mi.sendCommand(
+			`-data-evaluate-expression --thread ${threadId} --frame ${frameLevel} ${quoteMiString(expression)}`);
+		const raw = miString(record.results['value']).trim();
+		// GDB may append a symbol: "4198400 <main>". Take the leading number.
+		const m = /^(0x[0-9a-fA-F]+|-?\d+)/.exec(raw);
+		if (!m) {
+			return undefined;
+		}
+		return BigInt(m[1]);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Resolve the address to show in the memory viewer for `expression`.
  *
  * Pointers and arrays resolve to what they point at - that is what someone
@@ -193,26 +228,11 @@ export async function resolveMemoryAddress(
 	const target = shape.isPointer || shape.isArray
 		? `(unsigned long long)(${expression})`
 		: `(unsigned long long)&(${expression})`;
-	try {
-		const record = await mi.sendCommand(
-			`-data-evaluate-expression --thread ${threadId} --frame ${frameLevel} ${quoteMiString(target)}`);
-		const raw = miString(record.results['value']).trim();
-		if (!raw) {
-			return undefined;
-		}
-		// GDB may append a symbol: "4198400 <main>". Take the leading number.
-		const m = /^(0x[0-9a-fA-F]+|\d+)/.exec(raw);
-		if (!m) {
-			return undefined;
-		}
-		const value = BigInt(m[1]);
-		if (value === 0n) {
-			// A null pointer has no memory to show; a variable at address 0 does
-			// not happen in practice, so treating both as "no reference" is safe.
-			return undefined;
-		}
-		return `0x${value.toString(16)}`;
-	} catch {
+	const value = await evaluateInteger(mi, target, threadId, frameLevel);
+	if (value === undefined || value === 0n) {
+		// A null pointer has no memory to show; a variable at address 0 does
+		// not happen in practice, so treating both as "no reference" is safe.
 		return undefined;
 	}
+	return `0x${value.toString(16)}`;
 }

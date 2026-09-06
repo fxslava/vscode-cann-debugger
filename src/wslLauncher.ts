@@ -11,11 +11,19 @@
  *   native   <gdb> --interpreter=mi2
  *   wsl      wsl.exe -d D -e /bin/bash -lc ". set_env.sh; exec <gdb> ..."
  *   docker   wsl.exe -d D -e docker exec -i C /bin/bash -lc ". set_env.sh; ..."
+ *   ssh      wsl.exe -d D -e sshpass -e ssh -T u@h "/bin/bash -lc '. set_env.sh; ...'"
+ *
+ * The last two differ in one way that is easy to miss. `docker exec` takes the
+ * guest shell as separate argv elements, which cross the boundary untouched.
+ * `ssh` does not: it joins its trailing arguments with spaces and feeds the
+ * result to the remote login shell, so the shell invocation has to be quoted
+ * into a single element first - hence the extra shQuote layer in the ssh case.
  *-------------------------------------------------------------------------*/
 
 import { ExecutionMode } from './configuration';
 import { buildContainerCommand, DockerOptions } from './dockerLauncher';
 import { MiLaunchSpec } from './mi/miConnection';
+import { buildSshCommand, SshOptions } from './sshLauncher';
 
 export interface WslOptions {
 	enabled?: boolean;
@@ -29,6 +37,7 @@ export interface DebuggerSpawnOptions {
 	mode: ExecutionMode;
 	wsl?: WslOptions;
 	docker?: DockerOptions;
+	ssh?: SshOptions;
 	/** Debugger executable inside the guest. */
 	gdbPath: string;
 	gdbArgs?: string[];
@@ -43,6 +52,12 @@ export interface DebuggerSpawnOptions {
 	/** Guest path of the CANN environment script to source. */
 	setupScript?: string;
 	environment?: Array<{ name: string; value: string }>;
+	/**
+	 * Environment the spawn inherits. Injected for tests; in production this is
+	 * the adapter's own environment, which is where the extension host left the
+	 * SSH password (see sshLauncher.DEFAULT_PASSWORD_ENV_VAR).
+	 */
+	hostEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -78,9 +93,23 @@ export function buildDebuggerSpawn(options: DebuggerSpawnOptions): MiLaunchSpec 
 		};
 	}
 
+	const hostEnv = options.hostEnv ?? process.env;
 	const shell = options.wsl?.shell || '/bin/bash';
 	const script = buildGuestScript(options, gdbArgv);
 	const shellArgv = [shell, '-lc', script];
+
+	if (options.mode === 'ssh') {
+		// One argv element, already quoted for the remote login shell.
+		const remoteCommand = `${shell} -lc ${shQuote(script)}`;
+		const invocation = buildSshCommand(options.ssh ?? {}, options.wsl, remoteCommand, hostEnv);
+		return {
+			command: invocation.argv[0],
+			args: invocation.argv.slice(1),
+			// SSHPASS rides here rather than in argv, and WSLENV carries it over
+			// the wsl.exe boundary when the client runs inside the distro.
+			env: { ...hostEnv, ...invocation.env },
+		};
+	}
 
 	const argv = options.mode === 'docker'
 		? buildContainerCommand(options.docker ?? {}, options.wsl, shellArgv)
@@ -91,7 +120,7 @@ export function buildDebuggerSpawn(options: DebuggerSpawnOptions): MiLaunchSpec 
 		args: argv.slice(1),
 		// WSLENV would be needed to forward host variables; we export inside the
 		// guest script instead, which is explicit and distro-independent.
-		env: process.env,
+		env: hostEnv,
 	};
 }
 
@@ -107,16 +136,20 @@ function buildWslCommand(wsl: WslOptions | undefined, innerArgv: string[]): stri
 	return argv.concat(innerArgv);
 }
 
+export interface SignalOptions {
+	mode: ExecutionMode;
+	wsl?: WslOptions;
+	docker?: DockerOptions;
+	ssh?: SshOptions;
+	hostEnv?: NodeJS.ProcessEnv;
+}
+
 /**
  * argv prefix that runs an arbitrary command in the same environment as the
  * debugger. Used by Pause, which needs to deliver SIGINT on the far side of
  * whatever boundaries the debugger lives behind.
  */
-export function buildSignalPrefix(options: {
-	mode: ExecutionMode;
-	wsl?: WslOptions;
-	docker?: DockerOptions;
-}): string[] | undefined {
+export function buildSignalPrefix(options: SignalOptions): string[] | undefined {
 	if (options.mode === 'native') {
 		return undefined;
 	}
@@ -127,7 +160,28 @@ export function buildSignalPrefix(options: {
 		// `buildContainerCommand` with an empty inner argv yields the prefix.
 		return buildContainerCommand(options.docker, options.wsl, []);
 	}
+	if (options.mode === 'ssh') {
+		if (!options.ssh?.host) {
+			return undefined;
+		}
+		// The caller appends ["kill","-INT",pid]; ssh joins those with spaces
+		// into a command the remote shell runs verbatim, so no quoting is owed.
+		return buildSshCommand(options.ssh, options.wsl, '', options.hostEnv).argv;
+	}
 	return buildWslCommand(options.wsl, []);
+}
+
+/**
+ * Environment the signal spawn needs. Only ssh has one: sshpass must find the
+ * password again, and the interrupt runs as its own short-lived process.
+ */
+export function buildSignalEnv(options: SignalOptions): NodeJS.ProcessEnv | undefined {
+	if (options.mode !== 'ssh' || !options.ssh?.host) {
+		return undefined;
+	}
+	const hostEnv = options.hostEnv ?? process.env;
+	const invocation = buildSshCommand(options.ssh, options.wsl, '', hostEnv);
+	return { ...hostEnv, ...invocation.env };
 }
 
 function buildGuestScript(options: DebuggerSpawnOptions, gdbArgv: string[]): string {

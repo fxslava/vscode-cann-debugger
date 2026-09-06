@@ -1,6 +1,7 @@
 .vscode/**
+.tmp/**
+scripts/**
 src/**
-node_modules/**
 tsconfig.json
 **/*.map
 **/*.ts

@@ -47,13 +47,20 @@ import {
 import { MiConnection, MiError, quoteMiString } from './mi/miConnection';
 import { miArray, miList, miNumber, miString, miTuple, MiRecord } from './mi/miParser';
 import { PathMapper } from './pathMapper';
-import { buildDebuggerSpawn, buildSignalPrefix } from './wslLauncher';
+import { buildDebuggerSpawn, buildSignalEnv, buildSignalPrefix } from './wslLauncher';
 import {
 	classifyType,
 	resolveMemoryAddress,
 	VarObject,
 	VarObjectManager,
 } from './varObjects';
+import {
+	createDefaultFormatterRegistry,
+	FormatterContext,
+	FormatterView,
+	ITypeFormatter,
+	TypeFormatterRegistry,
+} from './typeFormatters';
 
 /* -------------------------------------------------------------------------
  * Handle payloads
@@ -64,12 +71,48 @@ interface FrameRef {
 	level: number;
 }
 
+/** Children come straight from GDB's own varobj tree. */
+interface VarobjContainer {
+	kind: 'varobj';
+	varobj: VarObject;
+	frame: FrameRef;
+}
+
+/**
+ * Children are synthesised by a formatter from an already-measured view.
+ * `view.state` holds the formatter's paging state, so expanding page 20 of a
+ * tensor is one MI round trip and no re-measurement.
+ */
+interface FormattedContainer {
+	kind: 'formatted';
+	formatter: ITypeFormatter;
+	view: FormatterView;
+	frame: FrameRef;
+}
+
+/**
+ * A promise to expand `expression` if anyone ever asks - the hinge that lets a
+ * formatter hand out a variablesReference for a child it has not looked at.
+ * Resolving it re-enters the same "formatter, or native children?" decision
+ * one level down, which is what makes a vector of structs - or of vectors -
+ * keep working all the way down. The resolution is cached on the container
+ * because VS Code pages: the first request measures, later ones reuse.
+ */
+interface ExpansionContainer {
+	kind: 'expansion';
+	expression: string;
+	frame: FrameRef;
+	resolved?: VarobjContainer | FormattedContainer | 'none';
+}
+
 type VariableContainer =
 	| { kind: 'locals'; frame: FrameRef }
 	| { kind: 'arguments'; frame: FrameRef }
 	| { kind: 'registers'; frame: FrameRef }
 	| { kind: 'npu' }
-	| { kind: 'varobj'; varobj: VarObject; frame: FrameRef };
+	| VarobjContainer
+	| FormattedContainer
+	| ExpansionContainer;
 
 /** What we remember about a rendered variable, for setVariable / data breakpoints. */
 interface RenderedVariable {
@@ -94,6 +137,8 @@ export class AscendDebugSession extends LoggingDebugSession {
 	private readonly mi = new MiConnection();
 	private varManager = new VarObjectManager(this.mi);
 	private mapper = new PathMapper();
+	/** Consulted before GDB's own children, so broken pretty-printers lose. */
+	private readonly formatters: TypeFormatterRegistry = createDefaultFormatterRegistry();
 
 	private config!: AscendArguments;
 	private executionMode: ExecutionMode = 'wsl';
@@ -213,6 +258,7 @@ export class AscendDebugSession extends LoggingDebugSession {
 				mode,
 				wsl: args.wsl,
 				docker: args.execution?.docker,
+				ssh: args.execution?.ssh,
 				gdbPath: args.gdbPath || 'ascend-gdb',
 				gdbArgs: args.gdbArgs,
 				miMode: args.miMode,
@@ -324,6 +370,29 @@ export class AscendDebugSession extends LoggingDebugSession {
 		if (/executable file not found|command not found|ENOENT/i.test(message)) {
 			return '\n\nCheck "gdbPath" - for CANN 8.5 containers the MI driver is ' +
 				'/usr/local/Ascend/cann-8.5.0/tools/msdebug/bin/msdebug-mi.';
+		}
+		if (this.executionMode === 'ssh') {
+			const host = this.config?.execution?.ssh?.host ?? '<host>';
+			if (/sshpass/i.test(message)) {
+				return '\n\nsshpass is not installed where the ssh client runs. ' +
+					'Install it (apt-get install sshpass) or switch the target to key ' +
+					'authentication by setting execution.ssh.identityFile.';
+			}
+			if (/permission denied|authentication failed/i.test(message)) {
+				return `\n\nThe target ${host} rejected the credentials. Re-enter the ` +
+					'password in the Ascend NPU Target Manager, or check that the account ' +
+					'may log in over SSH.';
+			}
+			if (/host key verification failed|remote host identification has changed/i.test(message)) {
+				return `\n\nThe host key for ${host} no longer matches the one in ` +
+					'known_hosts. Remove the stale entry after confirming the target was ' +
+					'legitimately re-imaged.';
+			}
+			if (/connection refused|no route to host|timed out|could not resolve/i.test(message)) {
+				return `\n\nCould not reach ${host}. Check the address and that sshd is ` +
+					'listening; the ssh client runs inside WSL by default, so the distro ' +
+					'must be able to route to the NPU host.';
+			}
 		}
 		return '';
 	}
@@ -716,11 +785,13 @@ export class AscendDebugSession extends LoggingDebugSession {
 	): Promise<void> {
 		// Node cannot deliver SIGINT into WSL, so MiConnection falls back to
 		// running `kill -INT` inside the guest against the PID our wrapper echoed.
-		const ok = await this.mi.interrupt(buildSignalPrefix({
+		const signal = {
 			mode: this.executionMode,
 			wsl: this.config?.wsl,
 			docker: this.config?.execution?.docker,
-		}));
+			ssh: this.config?.execution?.ssh,
+		};
+		const ok = await this.mi.interrupt(buildSignalPrefix(signal), buildSignalEnv(signal));
 		if (!ok) {
 			this.sendErrorResponse(response, {
 				id: 1004,
@@ -906,6 +977,14 @@ export class AscendDebugSession extends LoggingDebugSession {
 				case 'varobj':
 					variables = await this.readChildren(container, args.variablesReference, args.start, args.count);
 					break;
+				case 'formatted':
+					variables = await this.readFormattedChildren(
+						container, args.variablesReference, args.start, args.count, args.filter);
+					break;
+				case 'expansion':
+					variables = await this.readExpansion(
+						container, args.variablesReference, args.start, args.count, args.filter);
+					break;
 			}
 			response.body = { variables };
 			this.sendResponse(response);
@@ -967,7 +1046,7 @@ export class AscendDebugSession extends LoggingDebugSession {
 	}
 
 	private async readChildren(
-		container: Extract<VariableContainer, { kind: 'varobj' }>,
+		container: VarobjContainer,
 		containerRef: number,
 		start?: number,
 		count?: number,
@@ -983,6 +1062,175 @@ export class AscendDebugSession extends LoggingDebugSession {
 		return out;
 	}
 
+	/* ---------------------------------------------------------------------
+	 * Synthetic children
+	 * ------------------------------------------------------------------ */
+
+	/** A formatter's window onto the debugger, bound to one frame. */
+	private formatterContext(frame: FrameRef): FormatterContext {
+		return {
+			mi: this.mi,
+			varManager: this.varManager,
+			threadId: frame.threadId,
+			frameLevel: frame.level,
+			// The reference is handed out now and honoured later, if ever:
+			// nothing is evaluated until the user actually expands the row.
+			reserveExpansion: (expression: string) =>
+				this.variableHandles.create({ kind: 'expansion', expression, frame }),
+		};
+	}
+
+	/**
+	 * Replace a value the debugger renders badly with a formatter's view of it.
+	 *
+	 * Returns undefined - and the caller falls back to GDB's own children -
+	 * when no formatter claims the type, when there is no expression to
+	 * evaluate against, or when the formatter inspects the object and decides
+	 * it is not really formattable after all. An uninitialised vector is the
+	 * case that matters: three raw pointers are more honest than 10^12
+	 * invented elements.
+	 */
+	private async tryFormat(
+		varobj: VarObject,
+		frame: FrameRef,
+		displayName: string,
+		pathExpr: string,
+		rendered: Map<string, RenderedVariable>,
+	): Promise<DebugProtocol.Variable | undefined> {
+		const formatter = this.formatters.find(varobj.type);
+		if (!formatter || !pathExpr) {
+			return undefined;
+		}
+
+		let view: FormatterView | undefined;
+		try {
+			view = await formatter.inspect(this.formatterContext(frame), pathExpr, varobj.type);
+		} catch (err) {
+			// A formatter must never be able to take down the Variables view.
+			logger.verbose(`formatter ${formatter.name} failed on ${pathExpr}: ${(err as Error).message}`);
+			return undefined;
+		}
+		if (!view) {
+			return undefined;
+		}
+
+		const variable: DebugProtocol.Variable = {
+			name: displayName,
+			value: view.value,
+			type: varobj.type || undefined,
+			evaluateName: pathExpr,
+			// An empty container is a leaf: an expander that yields nothing is
+			// worse than no expander at all.
+			variablesReference: view.indexedVariables > 0
+				? this.variableHandles.create({ kind: 'formatted', formatter, view, frame })
+				: 0,
+			indexedVariables: view.indexedVariables || undefined,
+			memoryReference: view.memoryReference,
+		};
+
+		rendered.set(displayName, {
+			pathExpr,
+			varobjName: varobj.name,
+			memoryReference: view.memoryReference,
+		});
+		return variable;
+	}
+
+	/**
+	 * One page of a formatter's synthetic children.
+	 *
+	 * start/count are passed straight through. VS Code asks for [0,100) of a
+	 * 2048-element tensor and exactly those 100 elements cross the MI wire;
+	 * dropping the range here would put the whole tensor in every request,
+	 * which is precisely what the paging exists to prevent.
+	 */
+	private async readFormattedChildren(
+		container: FormattedContainer,
+		containerRef: number,
+		start?: number,
+		count?: number,
+		filter?: DebugProtocol.VariablesArguments['filter'],
+	): Promise<DebugProtocol.Variable[]> {
+		// Synthetic children are all indexed; there is nothing named to return.
+		if (filter === 'named') {
+			return [];
+		}
+
+		const first = Math.max(0, start ?? 0);
+		// DAP: a missing or zero count means "the rest of them".
+		const length = count && count > 0
+			? count
+			: Math.max(0, container.view.indexedVariables - first);
+
+		const children = await container.formatter.getChildren(
+			this.formatterContext(container.frame), container.view, first, length);
+
+		// Remember the elements so a watchpoint can be set on one. They have no
+		// varobj, so setVariable still refuses them - assigning through a
+		// synthetic child would need -gdb-set, which is a separate feature.
+		const rendered = this.renderedVariables.get(containerRef) ?? new Map<string, RenderedVariable>();
+		this.renderedVariables.set(containerRef, rendered);
+		for (const child of children) {
+			if (child.evaluateName) {
+				rendered.set(child.name, {
+					pathExpr: child.evaluateName,
+					memoryReference: child.memoryReference,
+				});
+			}
+		}
+		return children;
+	}
+
+	/**
+	 * Expand a synthetic child on demand. The varobj is created here, at the
+	 * moment someone clicks the twistie, rather than when the parent page was
+	 * rendered - so showing 2048 elements costs 2048 rows and zero varobjs.
+	 */
+	private async readExpansion(
+		container: ExpansionContainer,
+		containerRef: number,
+		start?: number,
+		count?: number,
+		filter?: DebugProtocol.VariablesArguments['filter'],
+	): Promise<DebugProtocol.Variable[]> {
+		if (container.resolved === undefined) {
+			container.resolved = await this.resolveExpansion(container.expression, container.frame);
+		}
+		if (container.resolved === 'none') {
+			return [];
+		}
+		return container.resolved.kind === 'formatted'
+			? this.readFormattedChildren(container.resolved, containerRef, start, count, filter)
+			: this.readChildren(container.resolved, containerRef, start, count);
+	}
+
+	/** Decide, one level down, whether a formatter or GDB owns the children. */
+	private async resolveExpansion(
+		expression: string,
+		frame: FrameRef,
+	): Promise<VarobjContainer | FormattedContainer | 'none'> {
+		let varobj: VarObject;
+		try {
+			varobj = await this.varManager.create(expression, frame.threadId, frame.level);
+		} catch (err) {
+			logger.verbose(`cannot expand ${expression}: ${(err as Error).message}`);
+			return 'none';
+		}
+
+		const formatter = this.formatters.find(varobj.type);
+		if (formatter) {
+			try {
+				const view = await formatter.inspect(this.formatterContext(frame), expression, varobj.type);
+				if (view) {
+					return { kind: 'formatted', formatter, view, frame };
+				}
+			} catch {
+				/* fall through to the debugger's own children */
+			}
+		}
+		return { kind: 'varobj', varobj, frame };
+	}
+
 	/**
 	 * Turn one varobj into a DAP variable, attaching:
 	 *  - variablesReference when it can be expanded,
@@ -996,6 +1244,15 @@ export class AscendDebugSession extends LoggingDebugSession {
 		displayName: string,
 		rendered: Map<string, RenderedVariable>,
 	): Promise<DebugProtocol.Variable> {
+		// The path expression is fetched first because a formatter needs one:
+		// `var4` means nothing to the expression evaluator, `scores` does.
+		const pathExpr = await this.varManager.pathExpression(varobj.name);
+
+		const formatted = await this.tryFormat(varobj, frame, displayName, pathExpr, rendered);
+		if (formatted) {
+			return formatted;
+		}
+
 		const shape = classifyType(varobj.type);
 		const expandable = varobj.numchild > 0 || varobj.hasMore;
 
@@ -1012,7 +1269,6 @@ export class AscendDebugSession extends LoggingDebugSession {
 			variable.indexedVariables = Math.min(shape.arrayLength, varobj.numchild || shape.arrayLength);
 		}
 
-		const pathExpr = await this.varManager.pathExpression(varobj.name);
 		if (pathExpr) {
 			variable.evaluateName = pathExpr;
 		}

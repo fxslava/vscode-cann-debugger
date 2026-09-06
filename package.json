@@ -23,7 +23,8 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
-    "onDebugResolve:ascend-gdb"
+    "onDebugResolve:ascend-gdb",
+    "onView:ascend-gdb.targetManager"
   ],
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -33,10 +34,12 @@
   },
   "dependencies": {
     "@vscode/debugadapter": "^1.68.0",
-    "@vscode/debugprotocol": "^1.68.0"
+    "@vscode/debugprotocol": "^1.68.0",
+    "ssh2": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/ssh2": "^1.15.6",
     "@types/vscode": "^1.86.0",
     "typescript": "^5.7.2"
   },
@@ -62,6 +65,17 @@
         "command": "ascend-gdb.sendMiCommand",
         "title": "Send Raw GDB/MI Command...",
         "category": "Ascend"
+      },
+      {
+        "command": "ascend-gdb.deployAndDebug",
+        "title": "Deploy & Debug on Ascend Target",
+        "category": "Ascend",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "ascend-gdb.openTargetManager",
+        "title": "Open NPU Target Manager",
+        "category": "Ascend"
       }
     ],
     "menus": {
@@ -74,12 +88,19 @@
           "command": "ascend-gdb.sendMiCommand",
           "when": "inDebugMode && debugType == ascend-gdb"
         }
+      ],
+      "view/title": [
+        {
+          "command": "ascend-gdb.deployAndDebug",
+          "when": "view == ascend-gdb.targetManager",
+          "group": "navigation"
+        }
       ]
     },
     "debuggers": [
       {
         "type": "ascend-gdb",
-        "label": "Ascend C (CANN / GDB-MI via WSL or Docker)",
+        "label": "Ascend C (CANN / GDB-MI via WSL, Docker or SSH)",
         "program": "./out/debugAdapter.js",
         "runtime": "node",
         "languages": [
@@ -159,12 +180,14 @@
                     "enum": [
                       "wsl",
                       "docker",
-                      "native"
+                      "native",
+                      "ssh"
                     ],
                     "enumDescriptions": [
                       "Run the debugger inside a WSL 2 distribution.",
                       "Run the debugger inside a running Docker container (optionally reached through WSL).",
-                      "Run the debugger directly on the host, with no boundary to cross."
+                      "Run the debugger directly on the host, with no boundary to cross.",
+                      "Run the debugger on a remote Ascend host over SSH (real NPU hardware)."
                     ],
                     "description": "Execution mode. Defaults to wsl (or native when wsl.enabled is false).",
                     "default": "docker"
@@ -210,6 +233,90 @@
                     "default": {
                       "containerName": "ascend-suites",
                       "viaWsl": true
+                    }
+                  },
+                  "ssh": {
+                    "type": "object",
+                    "description": "Remote Ascend host settings, used when mode is ssh.",
+                    "properties": {
+                      "host": {
+                        "type": "string",
+                        "description": "Hostname or IP of the Ascend target, e.g. 192.168.1.100.",
+                        "default": ""
+                      },
+                      "port": {
+                        "type": "number",
+                        "description": "TCP port of the remote sshd.",
+                        "default": 22
+                      },
+                      "user": {
+                        "type": "string",
+                        "description": "Remote account, e.g. HwHiAiUser or root.",
+                        "default": "HwHiAiUser"
+                      },
+                      "identityFile": {
+                        "type": "string",
+                        "description": "Private key on the machine that runs the ssh client. When set, no password is used.",
+                        "default": ""
+                      },
+                      "passwordEnvVar": {
+                        "type": "string",
+                        "description": "Environment variable holding the password, read by sshpass. The Target Manager fills ASCEND_SSH_PASSWORD from Secret Storage; never write a password into this file.",
+                        "default": "ASCEND_SSH_PASSWORD"
+                      },
+                      "sshPath": {
+                        "type": "string",
+                        "description": "ssh client executable, resolved on whichever side viaWsl selects.",
+                        "default": "ssh"
+                      },
+                      "sshpassPath": {
+                        "type": "string",
+                        "description": "sshpass executable; only used when a password is in play.",
+                        "default": "sshpass"
+                      },
+                      "sshArgs": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Extra ssh arguments, e.g. [\"-o\", \"Compression=yes\"].",
+                        "default": []
+                      },
+                      "strictHostKeyChecking": {
+                        "type": "string",
+                        "enum": [
+                          "accept-new",
+                          "yes",
+                          "no"
+                        ],
+                        "enumDescriptions": [
+                          "Trust a host the first time, refuse it later if the key changes.",
+                          "Refuse any host that is not already in known_hosts.",
+                          "Never check. Only for a throwaway lab network."
+                        ],
+                        "description": "An interactive prompt would hang the MI stream, so \"ask\" is not offered.",
+                        "default": "accept-new"
+                      },
+                      "viaWsl": {
+                        "type": "boolean",
+                        "description": "Run the ssh client inside the WSL distribution. Defaults to true on Windows, which ships an OpenSSH client but no sshpass.",
+                        "default": true
+                      },
+                      "serverAliveInterval": {
+                        "type": "number",
+                        "description": "Seconds between SSH keepalives; 0 disables them.",
+                        "default": 30
+                      },
+                      "deployPath": {
+                        "type": "string",
+                        "description": "Directory on the target the binary is deployed into. Informational for the adapter; used by Deploy & Debug.",
+                        "default": "/home/HwHiAiUser/ascend-debug"
+                      }
+                    },
+                    "default": {
+                      "host": "192.168.1.100",
+                      "port": 22,
+                      "user": "HwHiAiUser"
                     }
                   }
                 },
@@ -465,12 +572,14 @@
                     "enum": [
                       "wsl",
                       "docker",
-                      "native"
+                      "native",
+                      "ssh"
                     ],
                     "enumDescriptions": [
                       "Run the debugger inside a WSL 2 distribution.",
                       "Run the debugger inside a running Docker container (optionally reached through WSL).",
-                      "Run the debugger directly on the host, with no boundary to cross."
+                      "Run the debugger directly on the host, with no boundary to cross.",
+                      "Run the debugger on a remote Ascend host over SSH (real NPU hardware)."
                     ],
                     "description": "Execution mode. Defaults to wsl (or native when wsl.enabled is false).",
                     "default": "docker"
@@ -516,6 +625,90 @@
                     "default": {
                       "containerName": "ascend-suites",
                       "viaWsl": true
+                    }
+                  },
+                  "ssh": {
+                    "type": "object",
+                    "description": "Remote Ascend host settings, used when mode is ssh.",
+                    "properties": {
+                      "host": {
+                        "type": "string",
+                        "description": "Hostname or IP of the Ascend target, e.g. 192.168.1.100.",
+                        "default": ""
+                      },
+                      "port": {
+                        "type": "number",
+                        "description": "TCP port of the remote sshd.",
+                        "default": 22
+                      },
+                      "user": {
+                        "type": "string",
+                        "description": "Remote account, e.g. HwHiAiUser or root.",
+                        "default": "HwHiAiUser"
+                      },
+                      "identityFile": {
+                        "type": "string",
+                        "description": "Private key on the machine that runs the ssh client. When set, no password is used.",
+                        "default": ""
+                      },
+                      "passwordEnvVar": {
+                        "type": "string",
+                        "description": "Environment variable holding the password, read by sshpass. The Target Manager fills ASCEND_SSH_PASSWORD from Secret Storage; never write a password into this file.",
+                        "default": "ASCEND_SSH_PASSWORD"
+                      },
+                      "sshPath": {
+                        "type": "string",
+                        "description": "ssh client executable, resolved on whichever side viaWsl selects.",
+                        "default": "ssh"
+                      },
+                      "sshpassPath": {
+                        "type": "string",
+                        "description": "sshpass executable; only used when a password is in play.",
+                        "default": "sshpass"
+                      },
+                      "sshArgs": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Extra ssh arguments, e.g. [\"-o\", \"Compression=yes\"].",
+                        "default": []
+                      },
+                      "strictHostKeyChecking": {
+                        "type": "string",
+                        "enum": [
+                          "accept-new",
+                          "yes",
+                          "no"
+                        ],
+                        "enumDescriptions": [
+                          "Trust a host the first time, refuse it later if the key changes.",
+                          "Refuse any host that is not already in known_hosts.",
+                          "Never check. Only for a throwaway lab network."
+                        ],
+                        "description": "An interactive prompt would hang the MI stream, so \"ask\" is not offered.",
+                        "default": "accept-new"
+                      },
+                      "viaWsl": {
+                        "type": "boolean",
+                        "description": "Run the ssh client inside the WSL distribution. Defaults to true on Windows, which ships an OpenSSH client but no sshpass.",
+                        "default": true
+                      },
+                      "serverAliveInterval": {
+                        "type": "number",
+                        "description": "Seconds between SSH keepalives; 0 disables them.",
+                        "default": 30
+                      },
+                      "deployPath": {
+                        "type": "string",
+                        "description": "Directory on the target the binary is deployed into. Informational for the adapter; used by Deploy & Debug.",
+                        "default": "/home/HwHiAiUser/ascend-debug"
+                      }
+                    },
+                    "default": {
+                      "host": "192.168.1.100",
+                      "port": 22,
+                      "user": "HwHiAiUser"
                     }
                   }
                 },
@@ -651,9 +844,147 @@
                 "distro": "${3:Ubuntu-22.04}"
               }
             }
+          },
+          {
+            "label": "Ascend C: Deploy and debug on remote NPU hardware (SSH)",
+            "description": "Debug a binary already deployed to an Ascend device. Prefer the Ascend NPU Target Manager view, which also copies the binary and keeps the password out of this file.",
+            "body": {
+              "type": "ascend-gdb",
+              "request": "launch",
+              "name": "Ascend C: ${1:test_kernel} on NPU",
+              "program": "/home/HwHiAiUser/ascend-debug/${1:test_kernel}",
+              "cwd": "/home/HwHiAiUser/ascend-debug",
+              "stopAtEntry": true,
+              "execution": {
+                "mode": "ssh",
+                "ssh": {
+                  "host": "${2:192.168.1.100}",
+                  "user": "${3:HwHiAiUser}",
+                  "port": 22
+                }
+              },
+              "wsl": {
+                "enabled": true,
+                "distro": "${4:Ubuntu-22.04}"
+              },
+              "gdbPath": "/usr/local/Ascend/cann-8.5.0/tools/msdebug/bin/msdebug-mi",
+              "setupScript": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+            }
           }
         ]
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ascend",
+          "title": "Ascend NPU",
+          "icon": "media/ascend.svg"
+        }
+      ]
+    },
+    "views": {
+      "ascend": [
+        {
+          "type": "webview",
+          "id": "ascend-gdb.targetManager",
+          "name": "Target Manager",
+          "icon": "media/ascend.svg",
+          "contextualTitle": "Ascend NPU Target Manager"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Ascend C / CANN Debugger",
+      "properties": {
+        "ascend-gdb.target": {
+          "type": "object",
+          "scope": "resource",
+          "markdownDescription": "Deployment target managed by the **Ascend NPU Target Manager** view. The SSH password is never stored here - it lives in VS Code Secret Storage.",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "docker",
+                "hardware"
+              ],
+              "enumDescriptions": [
+                "Debug inside the CANN Docker container simulator.",
+                "Deploy over SSH and debug on a real Ascend NPU host."
+              ],
+              "default": "docker"
+            },
+            "program": {
+              "type": "string",
+              "description": "Host path of the built ELF. Supports ${workspaceFolder}.",
+              "default": "${workspaceFolder}/build/test_kernel"
+            },
+            "args": {
+              "type": "string",
+              "description": "Whitespace-separated arguments for the debuggee.",
+              "default": ""
+            },
+            "stopAtEntry": {
+              "type": "boolean",
+              "default": true
+            },
+            "host": {
+              "type": "string",
+              "description": "Hostname or IP of the Ascend target.",
+              "default": ""
+            },
+            "port": {
+              "type": "number",
+              "default": 22
+            },
+            "username": {
+              "type": "string",
+              "default": "HwHiAiUser"
+            },
+            "deployPath": {
+              "type": "string",
+              "description": "Absolute directory on the target the binary is copied into.",
+              "default": "/home/HwHiAiUser/ascend-debug"
+            },
+            "identityFile": {
+              "type": "string",
+              "description": "SSH private key on this machine. Empty means password authentication.",
+              "default": ""
+            },
+            "containerName": {
+              "type": "string",
+              "default": "ascend-suites"
+            },
+            "dockerViaWsl": {
+              "type": "boolean",
+              "default": true
+            },
+            "wslDistro": {
+              "type": "string",
+              "default": ""
+            },
+            "gdbPath": {
+              "type": "string",
+              "default": "/usr/local/Ascend/cann-8.5.0/tools/msdebug/bin/msdebug-mi"
+            },
+            "setupScript": {
+              "type": "string",
+              "default": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+            },
+            "updateLaunchJson": {
+              "type": "boolean",
+              "description": "Mirror the generated configuration into .vscode/launch.json.",
+              "default": true
+            }
+          },
+          "default": {
+            "mode": "docker",
+            "containerName": "ascend-suites",
+            "port": 22
+          }
+        }
+      }
+    }
   }
 }

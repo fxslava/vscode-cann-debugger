@@ -9,18 +9,81 @@
 import { execFile } from 'child_process';
 import * as vscode from 'vscode';
 import { AscendLaunchArguments, NpuMemoryRegion } from './configuration';
+import { DEFAULT_PASSWORD_ENV_VAR } from './sshLauncher';
+import { readPassword } from './targetManager/targetConfig';
+import { TargetViewProvider } from './targetManager/targetViewProvider';
 
 const DEBUG_TYPE = 'ascend-gdb';
 
 export function activate(context: vscode.ExtensionContext): void {
+	const targetView = new TargetViewProvider(context);
+
 	context.subscriptions.push(
 		vscode.debug.registerDebugConfigurationProvider(
 			DEBUG_TYPE,
 			new AscendConfigurationProvider(),
 		),
+		vscode.debug.registerDebugAdapterDescriptorFactory(
+			DEBUG_TYPE,
+			new AscendAdapterDescriptorFactory(context),
+		),
+		vscode.window.registerWebviewViewProvider(TargetViewProvider.viewType, targetView, {
+			// Keep the form (and any half-typed password) alive while the user
+			// switches to another view; re-creating it would clear the field.
+			webviewOptions: { retainContextWhenHidden: true },
+		}),
 		vscode.commands.registerCommand('ascend-gdb.viewNpuMemory', viewNpuMemory),
 		vscode.commands.registerCommand('ascend-gdb.sendMiCommand', sendMiCommand),
+		vscode.commands.registerCommand('ascend-gdb.deployAndDebug', () =>
+			targetView.deployAndDebugFromCommand()),
+		vscode.commands.registerCommand('ascend-gdb.openTargetManager', () =>
+			vscode.commands.executeCommand(`${TargetViewProvider.viewType}.focus`)),
 	);
+}
+
+/**
+ * Hands the adapter its SSH password through the environment.
+ *
+ * The alternative - putting it in the debug configuration - would leak it into
+ * `session.configuration`, which any other extension can read, and into
+ * launch.json the moment the user saved the configuration. An environment
+ * variable on a process VS Code spawns for this session alone is visible to
+ * that process and its children, which is exactly the set that needs it:
+ * sshLauncher copies it into SSHPASS for the ssh child and nowhere else.
+ */
+class AscendAdapterDescriptorFactory implements vscode.DebugAdapterDescriptorFactory {
+	constructor(private readonly context: vscode.ExtensionContext) {}
+
+	public async createDebugAdapterDescriptor(
+		session: vscode.DebugSession,
+		executable: vscode.DebugAdapterExecutable | undefined,
+	): Promise<vscode.DebugAdapterDescriptor> {
+		const command = executable?.command ?? process.execPath;
+		const args = executable?.args ?? [this.context.asAbsolutePath('out/debugAdapter.js')];
+		const options = executable?.options ?? {};
+
+		const execution = (session.configuration as unknown as AscendLaunchArguments).execution;
+		const ssh = execution?.ssh;
+		if (execution?.mode !== 'ssh' || !ssh || ssh.identityFile) {
+			return new vscode.DebugAdapterExecutable(command, args, options);
+		}
+
+		const password = await readPassword(this.context.secrets, {
+			host: ssh.host,
+			port: ssh.port,
+			user: ssh.user,
+		});
+		if (!password) {
+			// Not fatal: the target may rely on an agent or a default key. The
+			// adapter reports the authentication failure with a usable hint.
+			return new vscode.DebugAdapterExecutable(command, args, options);
+		}
+
+		return new vscode.DebugAdapterExecutable(command, args, {
+			...options,
+			env: { ...(options.env ?? {}), [DEFAULT_PASSWORD_ENV_VAR]: password },
+		});
+	}
 }
 
 export function deactivate(): void {
@@ -79,6 +142,16 @@ class AscendConfigurationProvider implements vscode.DebugConfigurationProvider {
 		if (config.request === 'launch' && !args.program) {
 			await vscode.window.showErrorMessage(
 				'Ascend debug: "program" is required. Point it at the built kernel test binary.');
+			return undefined;
+		}
+
+		if (args.execution?.mode === 'ssh' && !args.execution.ssh?.host) {
+			const pick = await vscode.window.showErrorMessage(
+				'Ascend debug: execution.mode is "ssh" but no "execution.ssh.host" was set.',
+				'Open Target Manager');
+			if (pick === 'Open Target Manager') {
+				await vscode.commands.executeCommand('ascend-gdb.openTargetManager');
+			}
 			return undefined;
 		}
 

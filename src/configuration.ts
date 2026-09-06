@@ -1,5 +1,6 @@
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { DockerOptions } from './dockerLauncher';
+import { SshOptions } from './sshLauncher';
 import { WslOptions } from './wslLauncher';
 
 /**
@@ -8,12 +9,15 @@ import { WslOptions } from './wslLauncher';
  *  wsl    - inside a WSL 2 distribution
  *  docker - inside a running container, optionally reached through WSL when
  *           the Docker engine itself lives in the distro rather than on Windows
+ *  ssh    - on a remote Ascend host reached over SSH, i.e. real NPU hardware
+ *           rather than the container simulator
  */
-export type ExecutionMode = 'native' | 'wsl' | 'docker';
+export type ExecutionMode = 'native' | 'wsl' | 'docker' | 'ssh';
 
 export interface ExecutionOptions {
 	mode?: ExecutionMode;
 	docker?: DockerOptions;
+	ssh?: SshOptions;
 }
 
 export interface SetupCommand {

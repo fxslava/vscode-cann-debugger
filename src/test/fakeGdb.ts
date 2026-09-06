@@ -14,6 +14,60 @@ const GUEST_SOURCE = '/mnt/d/Projects/vllm-ascend/csrc/tests/add_custom.cpp';
 /** 16 bytes of recognisable payload served by -data-read-memory-bytes. */
 const MEMORY_AT_0X2000 = '000102030405060708090a0b0c0d0e0f';
 
+/*
+ * Two std::vector locals, laid out the way libstdc++ lays them out and broken
+ * the way CANN's msdebug-mi breaks them: the summary string is an error and
+ * the only native child is _Vector_base. Everything the formatter needs -
+ * _M_start, _M_finish, sizeof(*_M_start) - is readable, which is exactly the
+ * situation the synthetic children provider exists for.
+ *
+ * `castable: false` reproduces a debugger that rejects the array-cast page
+ * read, forcing the one-element-at-a-time fallback.
+ */
+interface FakeVector {
+	element: string;
+	elementSize: number;
+	start: number;
+	count: number;
+	castable: boolean;
+	/** Elements are structs, so each one is expandable in its own right. */
+	aggregate?: boolean;
+}
+
+const VECTORS: { [name: string]: FakeVector } = {
+	// Payload sits at 0x2000, so its 4 floats overlay the readable window above.
+	scores: { element: 'float', elementSize: 4, start: 0x2000, count: 4, castable: true },
+	weights: { element: 'double', elementSize: 8, start: 0x3000, count: 3, castable: false },
+	tilings: {
+		element: 'TilingData', elementSize: 8, start: 0x4000, count: 2,
+		castable: true, aggregate: true,
+	},
+};
+
+const VECTOR_TYPE = (v: FakeVector): string =>
+	`std::vector<${v.element}, std::allocator<${v.element}> >`;
+
+/** Distinct per index, so a mis-paged read surfaces as a wrong number. */
+function elementValue(vector: string, index: number): string {
+	if (VECTORS[vector]?.aggregate) {
+		return '{...}';
+	}
+	return vector === 'scores' ? `${index}.5` : `${100 + index}.25`;
+}
+
+/** Array-slice varobjs handed out by -var-create, keyed by varobj name. */
+const slices = new Map<string, { vector: string; first: number; length: number }>();
+/** Single-element varobjs, keyed by varobj name -> the expression behind it. */
+const elements = new Map<string, string>();
+let syntheticVarobjs = 0;
+
+/** The fields of a struct element, so a nested expansion has something to show. */
+function structChildren(varobj: string): string {
+	return 'numchild="2",children=[' +
+		`child={name="${varobj}.totalLength",exp="totalLength",numchild="0",value="2048",type="uint32_t"},` +
+		`child={name="${varobj}.tileNum",exp="tileNum",numchild="0",value="16",type="uint32_t"}],has_more="0"`;
+}
+
 function out(line: string): void {
 	process.stdout.write(line + '\n');
 }
@@ -106,12 +160,61 @@ function handle(token: string, command: string): void {
 	}
 
 	if (command.startsWith('-stack-list-variables')) {
-		done(token, 'variables=[{name="tiling",arg="1"},{name="xGm"},{name="loopCount"}]');
+		done(token,
+			'variables=[{name="tiling",arg="1"},{name="xGm"},{name="loopCount"},' +
+			'{name="scores"},{name="weights"},{name="tilings"}]');
 		return;
 	}
 
 	if (command.startsWith('-var-create')) {
 		const expression = /"([^"]+)"\s*$/.exec(command)?.[1] ?? '';
+
+		// A whole page at once: *(float (*)[4])((scores)._M_impl._M_start + 0)
+		const slice = /^\*\((\w+) \(\*\)\[(\d+)\]\)\(\((\w+)\)\._M_impl\._M_start \+ (\d+)\)$/.exec(expression);
+		if (slice) {
+			const [, castType, length, name, first] = slice;
+			const vector = VECTORS[name];
+			if (!vector) {
+				error(token, `No symbol "${name}" in current context.`);
+				return;
+			}
+			if (!vector.castable) {
+				// What LLDB says when it cannot synthesise the array type.
+				error(token, `unable to find a C type for '${castType} (*)[${length}]'`);
+				return;
+			}
+			const varobj = `varSlice${syntheticVarobjs++}`;
+			slices.set(varobj, { vector: name, first: Number(first), length: Number(length) });
+			done(token,
+				`name="${varobj}",numchild="${length}",value="[${length}]",` +
+				`type="${vector.element} [${length}]",has_more="0"`);
+			return;
+		}
+
+		// One element: *((weights)._M_impl._M_start + 2). Reached both by the
+		// element-at-a-time fallback and by expanding a struct element.
+		const element = /^\*\(\((\w+)\)\._M_impl\._M_start \+ (\d+)\)$/.exec(expression);
+		if (element && VECTORS[element[1]]) {
+			const vector = VECTORS[element[1]];
+			const varobj = `varElem${syntheticVarobjs++}`;
+			elements.set(varobj, expression);
+			done(token,
+				`name="${varobj}",numchild="${vector.aggregate ? 2 : 0}",` +
+				`value="${elementValue(element[1], Number(element[2]))}",` +
+				`type="${vector.element}",has_more="0"`);
+			return;
+		}
+
+		if (VECTORS[expression]) {
+			// The broken state this whole feature exists to work around.
+			const vector = VECTORS[expression];
+			done(token,
+				`name="var_${expression}",numchild="1",` +
+				`value="error: summary string parsing error",` +
+				`type="${VECTOR_TYPE(vector)}",has_more="0"`);
+			return;
+		}
+
 		switch (expression) {
 			case 'xGm':
 				done(token, 'name="var1",numchild="0",value="0x2000",type="__gm__ half *",has_more="0"');
@@ -130,12 +233,38 @@ function handle(token: string, command: string): void {
 
 	if (command.startsWith('-var-info-path-expression')) {
 		const name = /"([^"]+)"/.exec(command)?.[1] ?? '';
-		const map: { [k: string]: string } = { var1: 'xGm', var2: 'loopCount', var3: 'tiling' };
+		// A field of a struct element: (*((tilings)._M_impl._M_start + 1)).tileNum
+		const field = /^(varElem\d+)\.(\w+)$/.exec(name);
+		if (field && elements.has(field[1])) {
+			done(token, `path_expr="(${elements.get(field[1])}).${field[2]}"`);
+			return;
+		}
+		const map: { [k: string]: string } = {
+			var1: 'xGm', var2: 'loopCount', var3: 'tiling',
+			var_scores: 'scores', var_weights: 'weights', var_tilings: 'tilings',
+		};
 		done(token, `path_expr="${map[name] ?? name}"`);
 		return;
 	}
 
 	if (command.startsWith('-var-list-children')) {
+		const name = /"([^"]+)"/.exec(command)?.[1] ?? '';
+		const slice = slices.get(name);
+		if (slice) {
+			const vector = VECTORS[slice.vector];
+			const children: string[] = [];
+			for (let i = 0; i < slice.length; i++) {
+				children.push(
+					`child={name="${name}.${i}",exp="[${i}]",numchild="${vector.aggregate ? 2 : 0}",` +
+					`value="${elementValue(slice.vector, slice.first + i)}",type="${vector.element}"}`);
+			}
+			done(token, `numchild="${slice.length}",children=[${children.join(',')}],has_more="0"`);
+			return;
+		}
+		if (elements.has(name)) {
+			done(token, structChildren(name));
+			return;
+		}
 		done(token,
 			'numchild="2",children=[' +
 			'child={name="var3.totalLength",exp="totalLength",numchild="0",value="1024",type="uint32_t"},' +
@@ -145,6 +274,24 @@ function handle(token: string, command: string): void {
 
 	if (command.startsWith('-data-evaluate-expression')) {
 		const expression = /"(.+)"\s*$/.exec(command)?.[1] ?? '';
+
+		const sizeofElement = /^sizeof\(\*\((\w+)\)\._M_impl\._M_start\)$/.exec(expression);
+		if (sizeofElement && VECTORS[sizeofElement[1]]) {
+			done(token, `value="${VECTORS[sizeofElement[1]].elementSize}"`);
+			return;
+		}
+
+		// _M_start and _M_finish are readable even when the summary is not.
+		const member = /\((\w+)\)\._M_impl\._M_(start|finish)$/.exec(expression);
+		if (member && VECTORS[member[1]]) {
+			const vector = VECTORS[member[1]];
+			const address = member[2] === 'start'
+				? vector.start
+				: vector.start + vector.count * vector.elementSize;
+			done(token, `value="${address}"`);
+			return;
+		}
+
 		if (expression.includes('xGm')) {
 			done(token, 'value="8192"');           // 0x2000, the pointer's target
 			return;
